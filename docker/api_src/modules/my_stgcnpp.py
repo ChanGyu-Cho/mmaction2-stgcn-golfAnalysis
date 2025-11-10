@@ -28,7 +28,7 @@ train_pipeline = [
     dict(type='GenSkeFeat', dataset='coco', feats=['bm']),
     dict(type='UniformSampleFrames', clip_len=clip_len),
     dict(type='PoseDecode'),
-    dict(type='FormatGCNInput', num_person=2),
+    dict(type='FormatGCNInput', num_person=1),
     dict(type='PackActionInputs')
 ]
 val_pipeline = [
@@ -37,7 +37,7 @@ val_pipeline = [
     dict(
         type='UniformSampleFrames', clip_len=clip_len, num_clips=1, test_mode=True),
     dict(type='PoseDecode'),
-    dict(type='FormatGCNInput', num_person=2),
+    dict(type='FormatGCNInput', num_person=1),
     dict(type='PackActionInputs')
 ]
 test_pipeline = [
@@ -47,7 +47,7 @@ test_pipeline = [
         type='UniformSampleFrames', clip_len=clip_len, num_clips=10,
         test_mode=True),
     dict(type='PoseDecode'),
-    dict(type='FormatGCNInput', num_person=2),
+    dict(type='FormatGCNInput', num_person=1),
     dict(type='PackActionInputs')
 ]
 
@@ -122,11 +122,10 @@ model = dict(
         graph_cfg=dict(layout='coco', mode='spatial')),
     cls_head=dict(
         type='GCNHead',
-        num_classes=2,
+        num_classes=5,
         in_channels=256,
         loss_cls=dict(
             type='CrossEntropyLoss',
-            class_weight=[2.0, 1.0],  # ← 리스트 리터럴로!
             loss_weight=1.0
         )
     )

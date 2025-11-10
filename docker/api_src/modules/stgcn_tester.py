@@ -19,6 +19,16 @@ from mmengine.runner import Runner
 # is populated from the correct package (avoids stale/site-package binding).
 from modules.utils import debug_log, csv_to_pkl
 
+# New label mapping for updated checkpoint outputs:
+# 0: worst, 1: bad, 2: normal, 3: good, 4: best
+LABEL_MAP = {
+    0: 'worst',
+    1: 'bad',
+    2: 'normal',
+    3: 'good',
+    4: 'best',
+}
+
 
 def prepare_config_for_test(csv_path: Path):
     """
@@ -31,7 +41,7 @@ def prepare_config_for_test(csv_path: Path):
     
     # checkpoint 경로 찾기
     for p in [
-        Path(__file__).parent.parent / "stgcn_70p.pth"
+        Path(__file__).parent.parent / "best_acc_top1_epoch_18.pth"
     ]:
         if Path(p).exists():
             checkpoint_path = str(p)
@@ -45,12 +55,20 @@ def prepare_config_for_test(csv_path: Path):
     
     # 2. CSV를 ann.pkl로 변환
     unique_id = uuid.uuid4().hex[:8]
-    ann_pkl_path = Path(tempfile.gettempdir()) / f"test_ann_{unique_id}.pkl"
+    # Prefer workspace-local results directory so files are visible outside the container
+    repo_results_dir = Path(__file__).parent / 'results'
+    try:
+        repo_results_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        # fallback to system tempdir
+        repo_results_dir = Path(tempfile.gettempdir())
+
+    ann_pkl_path = repo_results_dir / f"test_ann_{unique_id}.pkl"
     debug_log(f"Converting CSV to PKL: {csv_path} -> {ann_pkl_path}")
     csv_to_pkl(csv_path, ann_pkl_path)
     
     # 3. result.pkl 경로 설정
-    result_pkl_path = Path(tempfile.gettempdir()) / f"test_result_{unique_id}.pkl"
+    result_pkl_path = repo_results_dir / f"test_result_{unique_id}.pkl"
     
     # Make sure local mmaction2 package is importable so model classes (e.g. RecognizerGCN)
     # are registered before loading the config. We try the repo-local path and the
@@ -332,10 +350,73 @@ def run_stgcn_test(csv_path: Path):
                 debug_log(f"Cleaned up: {ann_pkl_path}")
         except Exception as _e:
             debug_log(f"Failed to cleanup {ann_pkl_path}: {_e}")
+        # By default we clean up the result PKL. If an operator wants to keep
+        # the result file for debugging/inspection, set the environment
+        # variable MMACTION_PRESERVE_RESULT=1 (or true).
         try:
+            preserve = str(os.environ.get('MMACTION_PRESERVE_RESULT', '0')).lower() in ('1', 'true', 'yes')
             if result_pkl_path and Path(result_pkl_path).exists():
-                Path(result_pkl_path).unlink()
-                debug_log(f"Cleaned up: {result_pkl_path}")
+                # Before deleting (or even if preserving), write a human-readable
+                # log file next to the PKL so operators can inspect the parsed
+                # result without requiring pickle loading.
+                try:
+                    import json
+                    import numpy as _np
+
+                    def _safe_convert(obj):
+                        # Convert numpy arrays and other non-JSON-able items
+                        if isinstance(obj, (bytes, bytearray)):
+                            return obj.decode('utf-8', errors='replace')
+                        if isinstance(obj, _np.ndarray):
+                            return obj.tolist()
+                        if isinstance(obj, ( _np.generic, )):
+                            return obj.item()
+                        # fallback to string
+                        try:
+                            json.dumps(obj)
+                            return obj
+                        except Exception:
+                            return str(obj)
+
+                    # Try to load parsed result (if available in this scope).
+                    # We'll attempt to read the PKL raw if parsed_result isn't present.
+                    parsed_to_dump = None
+                    try:
+                        # if result_data was left in local scope earlier, use parsed_result
+                        parsed_to_dump = parsed_result if 'parsed_result' in locals() else None
+                    except Exception:
+                        parsed_to_dump = None
+
+                    if parsed_to_dump is None:
+                        # Attempt to load pickled data and create a safe representation
+                        try:
+                            with open(result_pkl_path, 'rb') as _f:
+                                _raw = pickle.load(_f)
+                            # If it's a list/dict, try to convert elements
+                            def _normalize(o):
+                                if isinstance(o, dict):
+                                    return {k: _normalize(v) for k, v in o.items()}
+                                if isinstance(o, list):
+                                    return [_normalize(x) for x in o]
+                                return _safe_convert(o)
+                            parsed_to_dump = _normalize(_raw)
+                        except Exception as _e:
+                            parsed_to_dump = {"_load_error": str(_e)}
+
+                    log_path = Path(str(result_pkl_path) + '.log')
+                    try:
+                        with open(log_path, 'w', encoding='utf-8') as _logf:
+                            json.dump(parsed_to_dump, _logf, ensure_ascii=False, indent=2)
+                        debug_log(f"Wrote human-readable result log: {log_path}")
+                    except Exception as _e:
+                        debug_log(f"Failed to write result log {log_path}: {_e}")
+
+                except Exception as _e:
+                    debug_log(f"Unexpected error while preparing result log: {_e}")
+
+                # NOTE: Changed behavior per request: do NOT delete the result PKL.
+                # Always preserve the PKL so operators can inspect it directly.
+                debug_log(f"Preserving result PKL (no deletion performed): {result_pkl_path}")
         except Exception as _e:
             debug_log(f"Failed to cleanup {result_pkl_path}: {_e}")
 
@@ -359,45 +440,120 @@ def parse_test_result(result_data):
         return {
             "status": "success",
             "num_samples": 0,
-            "predictions": [],
+            # Single-sample pipeline: no prediction available
+            "prediction": None,
+            "debug": {
+                "note": "no samples in result_data"
+            }
         }
 
-    # For this API we only need the model's prediction (binary mapping):
-    # - treat predicted_class == 1 as True, predicted_class == 0 as False
-    # - ignore ground-truth fields (client is using this for inference only)
-    # To make the JSON frontend-friendly, return a simple list of booleans
-    # in `predictions` where each element corresponds to the sample index.
-    # Values are True/False (or None if prediction could not be resolved).
-    preds = []
-    for idx, item in enumerate(result_data):
-        pred_bool = None
-        # normalized predicted label extraction
-        if 'pred_label' in item:
-            try:
-                pred_bool = bool(int(item['pred_label']) == 1)
-            except Exception:
-                pred_bool = None
-        elif 'pred_labels' in item:
-            try:
-                pred_bool = bool(int(item['pred_labels']) == 1)
-            except Exception:
-                pred_bool = None
-        elif 'pred_scores' in item:
-            # fallback: if scores exist, pick argmax
+    # This function assumes a single-sample pipeline. If multiple results are
+    # present, only the first sample will be processed and a note will be
+    # included in the debug output.
+    if len(result_data) > 1:
+        debug_log(f"parse_test_result: received {len(result_data)} samples; processing only the first one")
+
+    item = result_data[0]
+
+    # Prepare default debug output
+    debug_info = {
+        "processed_sample_index": 0,
+        "note": None,
+    }
+
+    if not isinstance(item, dict):
+        debug_info["note"] = "first item is not a dict; cannot extract prediction"
+        return {
+            "status": "success",
+            "num_samples": len(result_data),
+            "prediction": None,
+            "debug": debug_info,
+        }
+
+    # Extract prediction index and raw scores where available
+    pred_idx = None
+    raw_scores = None
+    if 'pred_label' in item:
+        try:
+            pred_idx = int(item['pred_label'])
+        except Exception:
+            pred_idx = None
+    if pred_idx is None and 'pred_labels' in item:
+        try:
+            val = item['pred_labels']
+            if isinstance(val, (list, tuple)) and len(val) > 0:
+                pred_idx = int(val[0])
+            else:
+                pred_idx = int(val)
+        except Exception:
+            pred_idx = None
+    # Try multiple key names that may contain model outputs/scores/logits
+    score_keys = ['pred_scores', 'pred_score', 'scores', 'score', 'logits', 'outputs', 'pred_logits', 'output']
+    for k in score_keys:
+        if k in item and raw_scores is None:
             try:
                 import numpy as _np
-                scores = _np.asarray(item['pred_scores'])
-                pred_idx = int(_np.argmax(scores))
-                pred_bool = (pred_idx == 1)
+                raw_scores = _np.asarray(item[k], dtype=float)
+                if pred_idx is None and raw_scores.size > 0:
+                    pred_idx = int(_np.argmax(raw_scores))
+                break
             except Exception:
-                pred_bool = None
+                raw_scores = None
 
-        preds.append(pred_bool)
+    # Compute softmax probabilities if we have raw_scores
+    probs = None
+    topk = None
+    confidence = None
+    if raw_scores is not None:
+        try:
+            import numpy as _np
+            # stable softmax
+            rs = _np.asarray(raw_scores, dtype=float)
+            ex = _np.exp(rs - _np.max(rs))
+            probs_arr = ex / _np.sum(ex)
+            probs = probs_arr.tolist()
+            # top-k (k=5 or number of classes)
+            k = min(5, probs_arr.size)
+            idx_sorted = list(_np.argsort(probs_arr)[::-1])
+            topk = []
+            for i in idx_sorted[:k]:
+                topk.append({
+                    "index": int(i),
+                    "label": LABEL_MAP.get(int(i), int(i)),
+                    "prob": float(probs_arr[int(i)])
+                })
+            if pred_idx is not None and 0 <= pred_idx < len(probs_arr):
+                confidence = float(probs_arr[pred_idx])
+            # Emit a compact debug line so this information appears in logs
+            try:
+                dbg_topk = [{
+                    'index': int(x['index']),
+                    'label': x['label'],
+                    'prob': float(x['prob'])
+                } for x in topk] if topk else None
+                debug_log(f"parse_test_result: pred_index={pred_idx}, prediction={LABEL_MAP.get(pred_idx, pred_idx)}, confidence={confidence}, topk={dbg_topk}")
+            except Exception:
+                # swallow logging error
+                pass
+        except Exception:
+            probs = None
+            topk = None
+            confidence = None
+
+    # Map pred_idx to label if available
+    pred_label = LABEL_MAP.get(pred_idx, pred_idx) if pred_idx is not None else None
 
     result = {
         "status": "success",
         "num_samples": len(result_data),
-        "predictions": preds,
+        # Single-sample pipeline convenience field
+        "prediction": pred_label,
+        "pred_index": pred_idx,
+        "raw_scores": (raw_scores.tolist() if raw_scores is not None else None),
+        "probs": probs,
+        "confidence": confidence,
+        "topk": topk,
+        "debug": debug_info,
     }
 
     return result

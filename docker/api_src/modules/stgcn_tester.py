@@ -41,7 +41,7 @@ def prepare_config_for_test(csv_path: Path):
     
     # checkpoint 경로 찾기
     for p in [
-        Path(__file__).parent.parent / "best_acc_top1_epoch_18.pth"
+        Path(__file__).parent.parent / "model.pth"
     ]:
         if Path(p).exists():
             checkpoint_path = str(p)

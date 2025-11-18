@@ -11,16 +11,16 @@ BATCH_SIZE = 16
 NUM_WORKERS = 4
 LR = 0.001 
 WEIGHT_DECAY = 0.0005 
-MAX_EPOCHS = 100 
+MAX_EPOCHS = 50
 PATIENCE = 10 
 WARMUP_EPOCHS = 5 
-FEATS='j' # 'j' = joint features (x, y)
+FEATS='b' # 'j' = joint features (x, y)
 
 # ------------------------ Path Configuration ------------------------
-_load_checkpoint_path = r"D:\mmaction2\checkpoints\stgcnpp_8xb16-joint-u100-80e_ntu60-xsub-keypoint-2d_20221228-86e1e77a.pth"
+_load_checkpoint_path = r"D:\mmaction2\checkpoints\stgcnpp_8xb16-bone-u100-80e_ntu60-xsub-keypoint-2d_20221228-cd11a691.pth"
 dataset_type = 'PoseDataset'
-ann_file = r"E:\golfDataset\dataset\crop_pkl\combined_5class.pkl"
-test_ann_file = r"D:\golfDataset\dataset\crop_pkl\skeleton_dataset_test.pkl"
+ann_file = r"E:\golfDataset\dataset\crop_pkl\combined_3class.pkl"
+test_ann_file = r"D:\golfDataset\dataset\crop_pkl\combined_3class_test.pkl"
 EPOCH = MAX_EPOCHS
 clip_len = 100
 
@@ -119,7 +119,9 @@ param_scheduler = [
         begin=WARMUP_EPOCHS,
         end=EPOCH,
         by_epoch=True,
-        milestones=[MAX_EPOCHS*0.75, MAX_EPOCHS*0.9], 
+        # use percentages of the configured EPOCH for milestones so they adapt
+        # to changes in total epochs (e.g. for 50 epochs use ~30 and ~40)
+        milestones=[int(EPOCH * 0.6), int(EPOCH * 0.8)],
         gamma=0.1
     )
 ]
@@ -153,12 +155,13 @@ model = dict(
     ),
     cls_head=dict(
         type='GCNHead',
-        num_classes=5,
+        num_classes=3,
         in_channels=256,
         loss_cls=dict(
             type='CBFocalLoss', 
             loss_weight=1.0,
-            samples_per_cls=[48, 51, 491, 51, 474], 
+            # 🚨 클래스 인덱스(0, 1, 2, 3, 4) 순서에 따라 샘플 수를 정확히 반영
+            samples_per_cls=[1362, 1156, 2431],
             beta=0.9999,
             gamma=2.0 
         )

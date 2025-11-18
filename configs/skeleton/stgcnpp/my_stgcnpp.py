@@ -1,75 +1,86 @@
+# ===================================================================
+# STGCN++ 5-Class Golf Action Recognition Config - FINAL, FINAL, FINAL, FINAL VERSION (STABLE)
+# ===================================================================
+
+# ------------------------ Base Configuration ------------------------
 _base_ = '../../_base_/default_runtime.py'
+default_scope = 'mmaction'
 
-# Do not use global `load_from` so that the full checkpoint (including
-# classifier head) is not automatically loaded. Instead we explicitly
-# initialize only the backbone from the pretrained checkpoint below.
-_load_checkpoint_path = r"D:\mmaction2\checkpoints\stgcnpp_8xb16-joint-u100-80e_ntu60-xsub-keypoint-2d_20221228-86e1e77a.pth"
+# ------------------------ Tunable hyperparameters ------------------------
+BATCH_SIZE = 16
+NUM_WORKERS = 4
+LR = 0.001 
+WEIGHT_DECAY = 0.0005 
+MAX_EPOCHS = 50
+PATIENCE = 10 
+WARMUP_EPOCHS = 5 
+FEATS='b' # 'j' = joint features (x, y)
 
+# ------------------------ Path Configuration ------------------------
+_load_checkpoint_path = r"D:\mmaction2\checkpoints\stgcnpp_8xb16-bone-u100-80e_ntu60-xsub-keypoint-2d_20221228-cd11a691.pth"
 dataset_type = 'PoseDataset'
 ann_file = r"E:\golfDataset\dataset\crop_pkl\combined_5class.pkl"
 test_ann_file = r"D:\golfDataset\dataset\crop_pkl\skeleton_dataset_test.pkl"
+EPOCH = MAX_EPOCHS
+clip_len = 100
 
-# Runtime settings (safe defaults for API/container)
-EPOCH = 50
-clip_len = 50
-fp16 = None
-auto_scale_lr = dict(enable=False, base_batch_size=128)
-
-# ===================================================================
-# ⭐️ [최종 수정] 데이터 증강(Data Augmentation) - Flip 사용
-# ===================================================================
+# ------------------------ Data Pipeline (Train) ------------------------
 train_pipeline = [
-    dict(type='PreNormalize2D'),
-    dict(type='GenSkeFeat', dataset='coco', feats=['bm']),
-    # --- V4 수정: 'Flip'을 사용하고 스켈레톤 매핑 정보를 전달합니다. ---
+    # ⭐️ PreNormalize2D: 키포인트 데이터를 (0, 0)을 중심으로 재배치 (상대 좌표 변환)
+    dict(type='PreNormalize2D'), 
+    # GenSkeFeat: x, y 좌표와 신뢰도(c)를 기반으로 GCN이 사용할 특징을 생성
+    dict(type='GenSkeFeat', dataset='coco', feats=[FEATS]),
+    
+    # ⭐️ Resize 제거: 이미 PKL 생성 시 정규화(0to1)를 수행하거나, GenSkeFeat가 처리할 수 있음.
+    # ⭐️ RandomResizedCrop, RandomAffine 제거: 크롭 데이터로 인한 Assertion/ValueError 방지.
+    
     dict(
-        type='Flip',
+        type='Flip', # 좌우 대칭 증강만 유지
         flip_ratio=0.5,
-        # 이전에 사용하던 키포인트 매핑 정보를 다시 전달하여 스켈레톤 Flip이 정확히 이루어지도록 합니다.
         left_kp=[1, 3, 5, 7, 9, 11, 13, 15], 
         right_kp=[2, 4, 6, 8, 10, 12, 14, 16]
     ),
     dict(type='UniformSampleFrames', clip_len=clip_len),
     dict(type='PoseDecode'),
+    # FormatGCNInput: 최종적으로 (M, T, V, C) 텐서로 변환 (C는 FEATS에 따라 2 또는 3)
     dict(type='FormatGCNInput', num_person=1),
     dict(type='PackActionInputs')
 ]
+
+# ------------------------ Data Pipeline (Val/Test) ------------------------
 val_pipeline = [
     dict(type='PreNormalize2D'),
-    dict(type='GenSkeFeat', dataset='coco', feats=['bm']),
+    dict(type='GenSkeFeat', dataset='coco', feats=[FEATS]),
     dict(
-        type='UniformSampleFrames', clip_len=clip_len, num_clips=1, test_mode=True),
-    dict(type='PoseDecode'),
-    dict(type='FormatGCNInput', num_person=1),
-    dict(type='PackActionInputs')
-]
-test_pipeline = [
-    dict(type='PreNormalize2D'),
-    dict(type='GenSkeFeat', dataset='coco', feats=['bm']),
-    dict(
-        type='UniformSampleFrames', clip_len=clip_len, num_clips=10,
+        type='UniformSampleFrames', 
+        clip_len=clip_len, 
+        num_clips=10, 
         test_mode=True),
     dict(type='PoseDecode'),
     dict(type='FormatGCNInput', num_person=1),
     dict(type='PackActionInputs')
 ]
 
+test_pipeline = val_pipeline 
+
+# ------------------------ Data Loader & Loop ------------------------
 train_dataloader = dict(
-    batch_size=16,
-    num_workers=2,
+    batch_size=BATCH_SIZE,
+    num_workers=NUM_WORKERS,
     persistent_workers=True,
     sampler=dict(type='DefaultSampler', shuffle=True),
     dataset=dict(
         type='RepeatDataset',
-        times=5,
+        times=5, 
         dataset=dict(
             type=dataset_type,
             ann_file=ann_file,
             pipeline=train_pipeline,
             split='xsub_train')))
+
 val_dataloader = dict(
-    batch_size=16,
-    num_workers=2,
+    batch_size=BATCH_SIZE,
+    num_workers=NUM_WORKERS,
     persistent_workers=True,
     sampler=dict(type='DefaultSampler', shuffle=False),
     dataset=dict(
@@ -78,9 +89,10 @@ val_dataloader = dict(
         pipeline=val_pipeline,
         split='xsub_val',
         test_mode=True))
+
 test_dataloader = dict(
     batch_size=1,
-    num_workers=2,
+    num_workers=NUM_WORKERS,
     persistent_workers=True,
     sampler=dict(type='DefaultSampler', shuffle=False),
     dataset=dict(
@@ -94,34 +106,41 @@ train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=EPOCH, val_begin=1, val_
 val_cfg = dict(type='ValLoop')
 test_cfg = dict(type='TestLoop')
 
+# ------------------------ Learning Rate Scheduler ------------------------
 param_scheduler = [
     dict(
-        type='MultiStepLR',
+        type='LinearLR',
         begin=0,
-        end=EPOCH, # 50 Epoch
+        end=WARMUP_EPOCHS,
         by_epoch=True,
-        # LR이 너무 일찍 떨어지는 것을 방지 (예: 50 Epoch 중 30, 40 Epoch에서 감소)
-        milestones=[30, 40], 
+        start_factor=0.1),
+    dict(
+        type='MultiStepLR',
+        begin=WARMUP_EPOCHS,
+        end=EPOCH,
+        by_epoch=True,
+        # use percentages of the configured EPOCH for milestones so they adapt
+        # to changes in total epochs (e.g. for 50 epochs use ~30 and ~40)
+        milestones=[int(EPOCH * 0.6), int(EPOCH * 0.8)],
         gamma=0.1
     )
 ]
 
-# ===================================================================
-# ⭐️ [과적합 방지] 학습률 및 정규화(재확인)
-# ===================================================================
+# ------------------------ Optimizer ------------------------
 optim_wrapper = dict(
+    type='OptimWrapper',
     optimizer=dict(
-        type='SGD',
-        lr=0.001, 
-        momentum=0.9,
-        weight_decay=0.005, 
-        nesterov=True),
-    # 경사 클리핑을 5에서 2로 강화하여 불안정성 해소
-    clip_grad=dict(max_norm=0.5, norm_type=2))
+        type='Adam',
+        lr=LR, 
+        betas=(0.9, 0.999),
+        eps=1e-08,
+        weight_decay=WEIGHT_DECAY, 
+        amsgrad=False
+    ),
+    clip_grad=dict(max_norm=2, norm_type=2))
 
-auto_scale_lr = dict(enable=False, base_batch_size=128)
-
-val_evaluator = [dict(type='AccMetric')]
+# ------------------------ Model & Evaluator ------------------------
+val_evaluator = [dict(type='AccMetric')] 
 test_evaluator = val_evaluator
 
 model = dict(
@@ -139,11 +158,12 @@ model = dict(
         num_classes=5,
         in_channels=256,
         loss_cls=dict(
-            type='CrossEntropyLoss', 
+            type='CBFocalLoss', 
             loss_weight=1.0,
-            # ⭐️ [필수 수정] 클래스 가중치 추가
-            # 인덱스 0부터 순서대로 클래스 0, 1, 2, 3, 4에 대한 가중치
-            class_weight=[3.0, 0.4, 0.4, 0.6, 1.2] 
+            # 🚨 클래스 인덱스(0, 1, 2, 3, 4) 순서에 따라 샘플 수를 정확히 반영
+            samples_per_cls=[100, 1362, 1156, 2431, 100],
+            beta=0.9999,
+            gamma=2.0 
         )
     )
 )

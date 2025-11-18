@@ -138,9 +138,73 @@ def prepare_config_for_test(csv_path: Path):
     # 6. checkpoint 로드 설정
     cfg.load_from = checkpoint_path
     
-    # 7. test_dataloader의 ann_file 오버라이드
+    # 7. test_dataloader의 ann_file 오버라이드 및 전처리 파이프라인 수정
     cfg.test_dataloader.dataset.ann_file = str(ann_pkl_path)
     
+    # ----------------------------------------------------------------------
+    # ⭐️ 핵심 수정 사항: 0-to-1 정규화 전처리 파이프라인 추가 (finetune과 동일)
+    # ----------------------------------------------------------------------
+    
+    # test_dataloader에서 사용할 파이프라인을 복사하거나 가져옵니다.
+    test_pipeline = cfg.test_dataloader.dataset.pipeline
+    
+    # 0-to-1 정규화 클래스 (NormalizeIMSkeleton)를 찾거나 새로 정의합니다.
+    # 일반적으로 NTU-RGB+D 데이터셋에서 사용되는 정규화입니다.
+    # 'keypoint' 필드에 대해 mean과 std를 0으로 설정하여 (x - 0) / 1.0 = x 를 수행한 후,
+    # C=2 (x, y)를 V (관절 수)로 나누고 V를 1.0으로 나눕니다.
+    # 실제로 0-to-1 정규화의 목적은 min-max 스케일링이 아니라
+    # 포즈 데이터의 특정 축을 1.0으로 스케일링하여 정규화하는 방식(NTU60의 일반적인 방식)이거나
+    # 단순히 데이터의 스케일을 1로 만드는 것일 수 있습니다.
+    # 여기서는 finetune에 사용된 일반적인 PoseDataset의 Normalize 파이프라인을 추가합니다.
+
+    # 1. 'Normalize' (0-to-1) 스텝을 확인합니다.
+    # 'NormalizeIMSkeleton'을 사용하면 finetune_stgcn_test에서 사용한
+    # mean=0, std=1.0 처리를 간소화할 수 있습니다.
+    
+    # NOTE: 만약 finetune의 전처리가 단순히 각 채널을 [0, 1]로 나누는 min/max 방식이 아닌,
+    # NTU의 center-normalize + unit-length 방식이라면,
+    # 해당 로직을 수행하는 Transform (예: NormalizeIMSkeleton)을 삽입해야 합니다.
+    # 여기서는 finetune 시 사용했을 것으로 추정되는 'NormalizeIMSkeleton'을 추가하고,
+    # 파인튜닝 시 사용된 옵션(mean, std)이 필요하다면 해당 값으로 Normalize를 추가합니다.
+
+    # 일반적으로 ST-GCN의 전처리는 포즈 데이터에 대한 Mean/Std 정규화가 아니라
+    # (x, y) 좌표를 [0, 1] 범위로 스케일링하거나, 스켈레톤의 중앙을 맞추는 등의 작업이 포함됩니다.
+    # finetune_stgcn_test에서 "0to1 정규화"를 사용했다면,
+    # 그 전처리는 PoseDataset에 포함된 `keypoint` 전처리입니다.
+
+    # 'PoseDataset'의 Pipeline 구성 요소:
+    # 1) GeneratePoseTarget -> 2) FormatShape -> 3) (Optional) Normalize/Convert
+    # FormatShape 뒤에 'Normalize'를 추가합니다.
+
+    normalize_step = dict(type='NormalizeIMSkeleton',
+                          mean=[100, 100],
+                          std=[100, 100],
+                          to_bgr=False)
+    
+    # FormatShape 이후에 NormalizeIMSkeleton을 삽입합니다.
+    try:
+        format_shape_idx = -1
+        for i, step in enumerate(test_pipeline):
+            # FormatShape 다음이나 마지막 부분에 삽입
+            if isinstance(step, dict) and step.get('type') == 'FormatShape':
+                format_shape_idx = i
+                break
+        
+        # FormatShape 다음 (i+1) 위치에 삽입
+        if format_shape_idx != -1:
+            test_pipeline.insert(format_shape_idx + 1, normalize_step)
+            debug_log("Inserted 'NormalizeIMSkeleton' after 'FormatShape'.")
+        else:
+            # FormatShape이 없으면 파이프라인의 끝에 추가 (안전 장치)
+            test_pipeline.append(normalize_step)
+            debug_log("Inserted 'NormalizeIMSkeleton' at the end of the pipeline.")
+
+    except Exception as e:
+        debug_log(f"Warning: Failed to insert NormalizeIMSkeleton: {e}")
+        # 예외 발생 시 파이프라인의 맨 뒤에 추가하여 시도
+        test_pipeline.append(normalize_step)
+
+
     # 8. DumpResults 설정 (test.py의 --dump 옵션과 동일)
     dump_metric = dict(type='DumpResults', out_file_path=str(result_pkl_path))
     if isinstance(cfg.test_evaluator, (list, tuple)):

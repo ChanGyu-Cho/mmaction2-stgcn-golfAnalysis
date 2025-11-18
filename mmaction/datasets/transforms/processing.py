@@ -256,6 +256,33 @@ class RandomCrop(BaseTransform):
 
 
 @TRANSFORMS.register_module()
+class Collect(BaseTransform):
+    """Simple Collect transform for compatibility.
+
+    This implementation is intentionally lightweight: it ensures the
+    requested `keys` are present in the results and leaves data in-place.
+    It exists so configs that reference `Collect` can be built by the
+    mmengine/mmaction registry in environments where a different
+    Collect implementation is not available.
+    """
+
+    def __init__(self, keys=('keypoint', 'label'), meta_keys=()):
+        self.keys = tuple(keys) if keys is not None else ()
+        self.meta_keys = tuple(meta_keys) if meta_keys is not None else ()
+
+    def transform(self, results):
+        # Ensure requested keys are present; if not, set to None so later
+        # consumers don't KeyError on access. Keep original values intact.
+        for k in self.keys:
+            if k not in results:
+                results[k] = None
+        for mk in self.meta_keys:
+            if mk not in results:
+                results[mk] = None
+        return results
+
+
+@TRANSFORMS.register_module()
 class RandomResizedCrop(RandomCrop):
     """Random crop that specifics the area and height-weight ratio range.
 

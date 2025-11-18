@@ -60,6 +60,67 @@ TRANSFORMS = Registry(
     parent=MMENGINE_TRANSFORMS,
     locations=['mmaction.datasets.transforms'])
 
+# Ensure mmaction.TRANSFORMS contains mmengine's standard transforms
+# Note: avoid copying mmengine TRANSFORMS into mmaction.TRANSFORMS here.
+# Directly manipulating registry.module_dict can cause duplicate
+# registrations when the transforms modules are imported (decorators
+# register classes). Rely on the parent relationship so lookups fall
+# back to mmengine's TRANSFORMS at build time.
+
+# Ensure transforms defined in mmaction.datasets.transforms are also
+# available in mmengine's global TRANSFORMS registry. This import and
+# registration is best-effort and wrapped in try/except so it doesn't
+# break environments where imports fail during package inspection.
+try:  # pragma: no cover - best-effort runtime registration
+    # Import the mmaction transforms module to ensure module-level
+    # registrations (decorators) run and populate the local TRANSFORMS.
+    import importlib
+
+    importlib.import_module('mmaction.datasets.transforms')
+
+    # Copy registrations from mmaction.TRANSFORMS (local registry)
+    # into mmengine's global TRANSFORMS so mmengine.Compose can lookup
+    # mmaction-specific transform names. Try multiple registration
+    # invocation styles for compatibility across mmengine versions.
+    try:
+        from . import TRANSFORMS as MA_TRANSFORMS
+
+        for _name, _entry in MA_TRANSFORMS.module_dict.items():
+            if _name in MMENGINE_TRANSFORMS.module_dict:
+                continue
+            try:
+                # Preferred: provide module and name explicitly if supported
+                MMENGINE_TRANSFORMS.register_module(module=_entry, name=_name)
+            except Exception:
+                try:
+                    # Fallback: use decorator style without explicit name
+                    MMENGINE_TRANSFORMS.register_module()(_entry)
+                except Exception:
+                    try:
+                        # Fallback: decorator with name if supported
+                        MMENGINE_TRANSFORMS.register_module(name=_name)(_entry)
+                    except Exception:
+                        # give up on this entry but continue others
+                        pass
+    except Exception:
+        # ignore any issues copying registrations
+        pass
+    # After importing mmaction transforms and attempting to register them
+    # into mmengine.TRANSFORMS, copy any remaining entries from
+    # mmengine.TRANSFORMS into mmaction.TRANSFORMS so that lookups for
+    # built-in names (e.g., 'Collect') succeed when using the
+    # mmaction::transform registry. Only copy names that are missing to
+    # avoid overwriting mmaction-provided transforms.
+    try:
+        for _name, _entry in MMENGINE_TRANSFORMS.module_dict.items():
+            if _name not in TRANSFORMS.module_dict:
+                TRANSFORMS.module_dict[_name] = _entry
+    except Exception:
+        pass
+except Exception:
+    # if import fails (e.g., packaging or missing deps), skip silently
+    pass
+
 # manage all kinds of modules inheriting `nn.Module`
 MODELS = Registry(
     'model', parent=MMENGINE_MODELS, locations=['mmaction.models'])

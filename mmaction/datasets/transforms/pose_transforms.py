@@ -553,6 +553,257 @@ class PoseCompact(BaseTransform):
 
 
 @TRANSFORMS.register_module()
+class AddGaussianNoise(BaseTransform):
+    """Add Gaussian noise to keypoint coordinates.
+
+    This transform is coordinate-space noise intended for GCN-style
+    pipelines (keypoint arrays). It only perturbs the (x, y) channels.
+
+    Required Keys:
+        - keypoint
+
+    Modified Keys:
+        - keypoint
+
+    Args:
+        std (float): Standard deviation of Gaussian noise. Defaults to 0.01.
+        p (float): Probability of applying the noise. Defaults to 0.5.
+    """
+
+    def __init__(self, std: float = 0.01, p: float = 0.5) -> None:
+        self.std = float(std)
+        self.p = float(p)
+
+    def transform(self, results: Dict) -> Dict:
+        if 'keypoint' not in results:
+            return results
+        if np.random.rand() > self.p:
+            return results
+
+        kp = results['keypoint'].astype(np.float32)
+        # kp shape: (M, T, V, 2)
+        noise = np.random.normal(0.0, self.std, size=kp[..., :2].shape).astype(kp.dtype)
+        kp[..., :2] = kp[..., :2] + noise
+        results['keypoint'] = kp
+        return results
+
+    def __repr__(self) -> str:
+        return (f'{self.__class__.__name__}(std={self.std}, p={self.p})')
+
+
+@TRANSFORMS.register_module()
+class RandomAffine(BaseTransform):
+    """Apply random affine transform (scale, rotate, shift) to keypoints.
+
+    Works in normalized coordinate space (after `PreNormalize2D`).
+
+    Required Keys:
+        - keypoint
+
+    Modified Keys:
+        - keypoint
+
+    Args:
+        scale_range (tuple[float,float]): min/max scale. Defaults (1.0,1.0).
+        shift_range (tuple[float,float]): fraction shift in x/y in normalized units. Defaults (0,0).
+        rotate_range (tuple[int,int]): degrees range for rotation. Defaults (0,0).
+        shear_range (tuple[float,float]): shear (unused currently).
+        p (float): probability to apply. Defaults to 0.5.
+    """
+
+    def __init__(self,
+                 scale_range=(1.0, 1.0),
+                 shift_range=(0.0, 0.0),
+                 rotate_range=(0, 0),
+                 shear_range=(0.0, 0.0),
+                 p: float = 0.5) -> None:
+        self.scale_range = scale_range
+        self.shift_range = shift_range
+        self.rotate_range = rotate_range
+        self.shear_range = shear_range
+        self.p = float(p)
+
+    def transform(self, results: Dict) -> Dict:
+        if 'keypoint' not in results:
+            return results
+        if np.random.rand() > self.p:
+            return results
+
+        kp = results['keypoint'].astype(np.float32)
+        # kp shape: (M, T, V, C) where C >= 2
+        # compute valid mask (non-zero points)
+        mask = (kp[..., 0] != 0) | (kp[..., 1] != 0)
+
+        # compute global center from valid keypoints
+        valid_coords = kp[..., :2][mask]
+        if valid_coords.size == 0:
+            return results
+        center = valid_coords.mean(axis=0)
+
+        # sample params
+        scale = float(np.random.uniform(self.scale_range[0], self.scale_range[1]))
+        angle = float(np.random.uniform(self.rotate_range[0], self.rotate_range[1]))
+        angle = np.deg2rad(angle)
+        shift_x = float(np.random.uniform(self.shift_range[0], self.shift_range[1]))
+        shift_y = float(np.random.uniform(self.shift_range[0], self.shift_range[1]))
+
+        # build rotation+scale matrix
+        c, s = np.cos(angle), np.sin(angle)
+        M = np.array([[scale * c, -scale * s], [scale * s, scale * c]], dtype=np.float32)
+
+        # apply transform to each person/frame/joint where mask==True
+        coords = kp[..., :2]
+        coords_flat = coords.reshape(-1, 2)
+        mask_flat = mask.reshape(-1)
+        coords_valid = coords_flat[mask_flat]
+        # translate to center
+        coords_centered = coords_valid - center
+        coords_trans = coords_centered.dot(M.T)
+        # apply shift in normalized units
+        coords_trans += center + np.array([shift_x, shift_y], dtype=np.float32)
+        coords_flat[mask_flat] = coords_trans
+        coords = coords_flat.reshape(coords.shape)
+        kp[..., :2] = coords
+        results['keypoint'] = kp
+        return results
+
+    def __repr__(self) -> str:
+        return (f'{self.__class__.__name__}(scale_range={self.scale_range}, '
+                f'shift_range={self.shift_range}, rotate_range={self.rotate_range}, p={self.p})')
+
+
+@TRANSFORMS.register_module()
+class RandomKeypointDrop(BaseTransform):
+    """Randomly drop keypoints to simulate missing detections / occlusion.
+
+    This transform zeros out selected keypoints (and their score if present).
+
+    Required Keys:
+        - keypoint
+
+    Modified Keys:
+        - keypoint
+        - keypoint_score (optional)
+
+    Args:
+        drop_prob (float): Per-keypoint drop probability. Defaults to 0.05.
+    """
+
+    def __init__(self, drop_prob: float = 0.05) -> None:
+        self.drop_prob = float(drop_prob)
+
+    def transform(self, results: Dict) -> Dict:
+        if 'keypoint' not in results:
+            return results
+
+        kp = results['keypoint'].astype(np.float32)
+        # mask shape: (M, T, V)
+        mask = np.random.rand(*kp[..., 0].shape) < self.drop_prob
+        # expand mask to last dim (coords)
+        kp[mask] = 0.0
+        results['keypoint'] = kp
+
+        if 'keypoint_score' in results:
+            kps = results['keypoint_score'].astype(np.float32)
+            kps[mask] = 0.0
+            results['keypoint_score'] = kps
+
+        return results
+
+    def __repr__(self) -> str:
+        return f'{self.__class__.__name__}(drop_prob={self.drop_prob})'
+
+
+@TRANSFORMS.register_module()
+class RandomTemporalJitter(BaseTransform):
+    """Randomly jitter frame indices (only when `frame_inds` exists).
+
+    This transform adds a small random integer offset to each sampled
+    frame index to simulate temporal misalignment. It operates on
+    ``results['frame_inds']`` which is produced by sampling transforms
+    such as `SampleFrames`/`UniformSampleFrames`.
+
+    Required Keys:
+        - frame_inds
+
+    Modified Keys:
+        - frame_inds
+
+    Args:
+        max_shift (int): Maximum absolute shift (in frames). Defaults to 5.
+        p (float): Probability of applying jitter. Defaults to 0.5.
+    """
+
+    def __init__(self, max_shift: int = 5, p: float = 0.5) -> None:
+        self.max_shift = int(max_shift)
+        self.p = float(p)
+
+    def transform(self, results: Dict) -> Dict:
+        if 'frame_inds' not in results:
+            return results
+        if np.random.rand() > self.p:
+            return results
+
+        frame_inds = results['frame_inds'].astype(np.int32)
+        # frame_inds is 1D flattened array of indices for all clips
+        shifts = np.random.randint(-self.max_shift, self.max_shift + 1,
+                                   size=frame_inds.shape)
+        frame_inds = frame_inds + shifts
+        # keep indices within valid range [0, total_frames-1]
+        total_frames = int(results.get('total_frames', int(frame_inds.max()) + 1))
+        max_idx = max(0, total_frames - 1)
+        frame_inds = np.clip(frame_inds, 0, max_idx)
+        results['frame_inds'] = frame_inds.astype(np.int32)
+        return results
+
+    def __repr__(self) -> str:
+        return f'{self.__class__.__name__}(max_shift={self.max_shift}, p={self.p})'
+
+
+@TRANSFORMS.register_module()
+class RandomFrameDrop(BaseTransform):
+    """Randomly drop frames in the keypoint sequence by zeroing them out.
+
+    Required Keys:
+        - keypoint
+
+    Modified Keys:
+        - keypoint
+        - keypoint_score (optional)
+
+    Args:
+        drop_prob (float): Probability to drop each frame. Defaults to 0.05.
+    """
+
+    def __init__(self, drop_prob: float = 0.05) -> None:
+        self.drop_prob = float(drop_prob)
+
+    def transform(self, results: Dict) -> Dict:
+        if 'keypoint' not in results:
+            return results
+
+        kp = results['keypoint'].astype(np.float32)
+        # kp shape: (M, T, V, C) where C >= 2
+        M, T = kp.shape[0], kp.shape[1]
+        # per-frame drop mask for each person
+        drop_mask = np.random.rand(M, T) < self.drop_prob
+        for m in range(M):
+            kp[m, drop_mask[m]] = 0.0
+        results['keypoint'] = kp
+
+        if 'keypoint_score' in results:
+            kps = results['keypoint_score'].astype(np.float32)
+            for m in range(kps.shape[0]):
+                kps[m, drop_mask[m]] = 0.0
+            results['keypoint_score'] = kps
+
+        return results
+
+    def __repr__(self) -> str:
+        return f'{self.__class__.__name__}(drop_prob={self.drop_prob})'
+
+
+@TRANSFORMS.register_module()
 class PreNormalize3D(BaseTransform):
     """PreNormalize for NTURGB+D 3D keypoints (x, y, z).
 
@@ -820,6 +1071,36 @@ class JointToBone(BaseTransform):
                     f'dataset={self.dataset}, '
                     f'target={self.target})')
         return repr_str
+        # ---------------------------------------------------------------------------
+        # Backwards-compatibility: also register key transforms into mmengine's
+        # global TRANSFORMS registry so that codepaths using mmengine.TRANSFORMS
+        # (e.g., mmengine.dataset.Compose) can build them. This mirrors what
+        # OpenMMLab projects do when creating child registries with a parent.
+        try:
+            from mmengine.registry import TRANSFORMS as MMENGINE_TRANSFORMS
+
+            _to_register = [
+                'DecompressPose', 'GeneratePoseTarget', 'GenSkeFeat', 'JointToBone',
+                'MergeSkeFeat', 'MMCompact', 'MMDecode', 'MMUniformSampleFrames',
+                'PadTo', 'PoseCompact', 'PoseDecode', 'PreNormalize2D',
+                'PreNormalize3D', 'ToMotion', 'UniformSampleFrames',
+                'AddGaussianNoise', 'RandomKeypointDrop', 'RandomTemporalJitter',
+                'RandomFrameDrop', 'RandomAffine'
+            ]
+
+            for _name in _to_register:
+                _cls = globals().get(_name, None)
+                if _cls is None:
+                    continue
+                try:
+                    # register with mmengine registry
+                    MMENGINE_TRANSFORMS.register_module()(_cls)
+                except Exception:
+                    # ignore if already registered or registration fails
+                    pass
+        except Exception:
+            # if mmengine is not available, skip
+            pass
 
 
 @TRANSFORMS.register_module()

@@ -25,3 +25,43 @@ assert (digit_version(mmengine_minimum_version) <= mmengine_version
     f'<{mmengine_maximum_version}.'
 
 __all__ = ['__version__']
+
+# Ensure mmaction registries and transforms are imported when the package
+# is imported so that mmengine's global registries can discover custom
+# transforms and other components. This is a best-effort import that
+# should not break importing mmaction if something goes wrong.
+try:
+    # Import registry to run any registration side-effects there
+    from . import registry  # noqa: F401
+
+    # Import transforms module (module-level decorators/register calls)
+    # so that custom transforms (PreNormalize2D, AddGaussianNoise, etc.)
+    # are registered into the local mmaction registry. This import
+    # also helps in making them visible before mmengine.Compose builds
+    # pipelines that reference them.
+    from .datasets import transforms as transforms  # noqa: F401
+    # After importing, ensure entries from mmaction.registry.TRANSFORMS
+    # are copied into mmengine's global TRANSFORMS registry. We do a
+    # direct copy of module_dict as a robust fallback for mmengine
+    # versions where register_module invocation may behave differently.
+    try:
+        from . import registry as _local_registry
+        from mmengine.registry import TRANSFORMS as _mmengine_transforms
+
+        for _k, _v in getattr(_local_registry.TRANSFORMS, 'module_dict', {}).items():
+            if _k in getattr(_mmengine_transforms, 'module_dict', {}):
+                continue
+            try:
+                _mmengine_transforms.module_dict[_k] = _v
+            except Exception:
+                # best-effort: ignore entries that cannot be copied
+                pass
+    except Exception:
+        # don't fail package import if copying fails
+        pass
+except Exception as _err:  # pragma: no cover - import-time best-effort
+    import warnings
+
+    warnings.warn(
+        f"mmaction import-time registration warning: failed to import"
+        f" registries/transforms: {_err}")

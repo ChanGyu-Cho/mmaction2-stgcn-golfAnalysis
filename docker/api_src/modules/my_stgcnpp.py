@@ -1,48 +1,52 @@
 # ===================================================================
-# STGCN++ 5-Class Golf Action Recognition Config - FINAL, FINAL, FINAL, FINAL VERSION (STABLE)
+# STGCN++ 5-Class Golf Action Recognition Config - STABLE_V3.0 (Generalization & Class Imbalance Focus)
 # ===================================================================
 
 # ------------------------ Base Configuration ------------------------
-_base_ = '../../_base_/default_runtime.py'
+_base_ = 'default_runtime.py'
 default_scope = 'mmaction'
 
-# ------------------------ Tunable hyperparameters ------------------------
+# ------------------------ Tunable hyperparameters (일반화 및 불균형 강화 설정) ------------------------
 BATCH_SIZE = 16
 NUM_WORKERS = 4
-LR = 0.001 
+LR = 0.0001 
 WEIGHT_DECAY = 0.0005 
-MAX_EPOCHS = 100 
-PATIENCE = 10 
-WARMUP_EPOCHS = 5 
-FEATS='j' # 'j' = joint features (x, y)
+MAX_EPOCHS = 100
+PATIENCE = 10
+WARMUP_EPOCHS = 10 # 👈 Warmup 연장 (안정적인 학습 시작 유도)
+FEATS='b'
 
 # ------------------------ Path Configuration ------------------------
-_load_checkpoint_path = r"D:\mmaction2\checkpoints\stgcnpp_8xb16-joint-u100-80e_ntu60-xsub-keypoint-2d_20221228-86e1e77a.pth"
+_load_checkpoint_path = "../model.pth"
 dataset_type = 'PoseDataset'
-ann_file = r"E:\golfDataset\dataset\crop_pkl\combined_5class.pkl"
-test_ann_file = r"D:\golfDataset\dataset\crop_pkl\skeleton_dataset_test.pkl"
+ann_file = ""
+test_ann_file = ""
 EPOCH = MAX_EPOCHS
 clip_len = 100
 
 # ------------------------ Data Pipeline (Train) ------------------------
 train_pipeline = [
-    # ⭐️ PreNormalize2D: 키포인트 데이터를 (0, 0)을 중심으로 재배치 (상대 좌표 변환)
-    dict(type='PreNormalize2D'), 
-    # GenSkeFeat: x, y 좌표와 신뢰도(c)를 기반으로 GCN이 사용할 특징을 생성
-    dict(type='GenSkeFeat', dataset='coco', feats=[FEATS]),
+    dict(type='PreNormalize2D'),
     
-    # ⭐️ Resize 제거: 이미 PKL 생성 시 정규화(0to1)를 수행하거나, GenSkeFeat가 처리할 수 있음.
-    # ⭐️ RandomResizedCrop, RandomAffine 제거: 크롭 데이터로 인한 Assertion/ValueError 방지.
-    
+    # RandomAffine: 일반화 개선을 위해 범위 복구 (Test Set 분포 포괄)
     dict(
-        type='Flip', # 좌우 대칭 증강만 유지
+        type='RandomAffine',
+        scale_range=(0.8, 1.2), # 👈 범위 확대
+        shift_range=(-0.1, 0.1),
+        rotate_range=(-15, 15), # 👈 범위 확대
+        shear_range=(0, 0),
+        p=0.5
+    ),
+
+    dict(type='GenSkeFeat', dataset='coco', feats=[FEATS]),
+    dict(
+        type='Flip',
         flip_ratio=0.5,
-        left_kp=[1, 3, 5, 7, 9, 11, 13, 15], 
+        left_kp=[1, 3, 5, 7, 9, 11, 13, 15],
         right_kp=[2, 4, 6, 8, 10, 12, 14, 16]
     ),
     dict(type='UniformSampleFrames', clip_len=clip_len),
     dict(type='PoseDecode'),
-    # FormatGCNInput: 최종적으로 (M, T, V, C) 텐서로 변환 (C는 FEATS에 따라 2 또는 3)
     dict(type='FormatGCNInput', num_person=1),
     dict(type='PackActionInputs')
 ]
@@ -52,16 +56,28 @@ val_pipeline = [
     dict(type='PreNormalize2D'),
     dict(type='GenSkeFeat', dataset='coco', feats=[FEATS]),
     dict(
-        type='UniformSampleFrames', 
-        clip_len=clip_len, 
-        num_clips=10, 
+        type='UniformSampleFrames',
+        clip_len=clip_len,
+        num_clips=10,
         test_mode=True),
     dict(type='PoseDecode'),
     dict(type='FormatGCNInput', num_person=1),
     dict(type='PackActionInputs')
 ]
 
-test_pipeline = val_pipeline 
+test_pipeline = [
+    dict(type='PreNormalize2D'),
+    dict(type='GenSkeFeat', dataset='coco', feats=[FEATS]),
+    dict(
+        type='UniformSampleFrames',
+        clip_len=clip_len,
+        num_clips=10,
+        test_mode=True),
+    dict(type='PoseDecode'),
+    dict(type='FormatGCNInput', num_person=1),
+    dict(type='PackActionInputs') 
+]
+
 
 # ------------------------ Data Loader & Loop ------------------------
 train_dataloader = dict(
@@ -71,7 +87,7 @@ train_dataloader = dict(
     sampler=dict(type='DefaultSampler', shuffle=True),
     dataset=dict(
         type='RepeatDataset',
-        times=5, 
+        times=5,
         dataset=dict(
             type=dataset_type,
             ann_file=ann_file,
@@ -110,18 +126,16 @@ test_cfg = dict(type='TestLoop')
 param_scheduler = [
     dict(
         type='LinearLR',
+        start_factor=0.1,
+        by_epoch=True,
         begin=0,
-        end=WARMUP_EPOCHS,
-        by_epoch=True,
-        start_factor=0.1),
+        end=WARMUP_EPOCHS),
     dict(
-        type='MultiStepLR',
-        begin=WARMUP_EPOCHS,
-        end=EPOCH,
+        type='CosineAnnealingLR',
+        T_max=EPOCH - WARMUP_EPOCHS,
         by_epoch=True,
-        milestones=[MAX_EPOCHS*0.75, MAX_EPOCHS*0.9], 
-        gamma=0.1
-    )
+        begin=WARMUP_EPOCHS,
+        end=EPOCH)
 ]
 
 # ------------------------ Optimizer ------------------------
@@ -129,16 +143,16 @@ optim_wrapper = dict(
     type='OptimWrapper',
     optimizer=dict(
         type='Adam',
-        lr=LR, 
+        lr=LR,
         betas=(0.9, 0.999),
         eps=1e-08,
-        weight_decay=WEIGHT_DECAY, 
+        weight_decay=WEIGHT_DECAY,
         amsgrad=False
     ),
     clip_grad=dict(max_norm=2, norm_type=2))
 
 # ------------------------ Model & Evaluator ------------------------
-val_evaluator = [dict(type='AccMetric')] 
+val_evaluator = [dict(type='AccMetric')]
 test_evaluator = val_evaluator
 
 model = dict(
@@ -153,14 +167,17 @@ model = dict(
     ),
     cls_head=dict(
         type='GCNHead',
-        num_classes=5,
+        num_classes=5, # 5-class 유지
         in_channels=256,
+        dropout=0.3, # 👈 드롭아웃 감소로 과도한 정규화 방지
         loss_cls=dict(
-            type='CBFocalLoss', 
+            type='CBFocalLoss',
             loss_weight=1.0,
-            samples_per_cls=[48, 51, 491, 51, 474], 
-            beta=0.9999,
-            gamma=2.0 
+            # Worst(0)와 Bad(1)에 대한 집중도를 높이기 위해 샘플 수와 감마값 조정
+            # 0: 110, 1: 1116, 2: 1041, 3: 788, 4: 1401 (이전 데이터셋의 샘플 수 유지)
+            samples_per_cls=[110, 1116, 1041, 788, 1401], 
+            beta=0.99,
+            gamma=2.0 # 👈 감마값을 2.0으로 상향 조정하여 어려운 클래스(0, 1)에 더 집중
         )
     )
 )

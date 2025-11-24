@@ -5,6 +5,7 @@ from pathlib import Path
 import tempfile, base64, os
 import logging
 import sys
+import hashlib
 
 # test.py와 동일한 구조를 사용하는 stgcn_tester 모듈
 from modules.stgcn_tester import run_stgcn_test
@@ -39,11 +40,45 @@ def mmaction_stgcn_test_endpoint(payload: CSVBase64Request):
             tmp.write(csv_text)
             temp_csv = Path(tmp.name)
         
-        debug_log(f"Received request, temp_csv={temp_csv}")
+        # Log small debug summary about the received CSV so we can validate
+        # that different requests produce different temp files and payloads.
+        try:
+            h = hashlib.sha1(csv_text.encode('utf-8')).hexdigest()
+        except Exception:
+            h = None
+        debug_log(f"Received request, temp_csv={temp_csv}, sha1={h}, len={len(csv_text)}")
+        try:
+            debug_log(f"CSV preview: {csv_text[:200]!r}")
+        except Exception:
+            pass
         
         # test.py와 동일한 구조로 테스트 실행
         result = run_stgcn_test(temp_csv)
-        
+        try:
+            # short result summary for debugging
+            if isinstance(result, dict):
+                debug_log(f"Result summary: orig_pred_index={result.get('orig_pred_index')}, pred_index={result.get('pred_index')}, reduced_confidence={result.get('reduced_confidence')}")
+        except Exception:
+            pass
+
+        # If the tester returned the parsed dict with a JSON-safe 'raw_dump',
+        # include both the raw DumpResults list and the parsed summary so callers
+        # (frontends) can access high-level fields like prediction/confidence
+        # while preserving backward compatibility for callers that expect the
+        # raw list under `result`.
+        try:
+            if isinstance(result, dict) and 'raw_dump' in result and isinstance(result['raw_dump'], list):
+                return JSONResponse(status_code=200, content={
+                    "message": "OK",
+                    # legacy: keep raw DumpResults list for compatibility
+                    "result": result['raw_dump'],
+                    # new: include the parsed summary (prediction, probs, etc.)
+                    "parsed": result,
+                })
+        except Exception:
+            pass
+
+        # fallback: return whatever run_stgcn_test produced
         return JSONResponse(status_code=200, content={
             "message": "OK",
             "result": result

@@ -337,6 +337,11 @@ def main():
         except Exception:
             pass
 
+        # Prepare a storage list for captured raw outputs (filled when we
+        # successfully patch the model.forward below). Declared here so it is
+        # visible after runner.test() for post-processing and writing to disk.
+        _raw_outputs = []
+
         runner = Runner.from_cfg(cfg)
 
         try:
@@ -345,6 +350,60 @@ def main():
         except Exception:
             pass
 
+        # Attempt to monkey-patch the model's forward method to capture raw
+        # outputs (logits) produced during testing. This is a best-effort
+        # instrumentation that avoids changing the evaluator registry or
+        # model code and writes a separate `.raw_outputs.pkl` alongside the
+        # normal DumpResults file.
+        try:
+            model = getattr(runner, 'model', None)
+            if model is None:
+                # Some Runner variants attach the model under different names
+                model = getattr(runner, 'module', None)
+            if model is not None:
+                try:
+                    orig_forward = getattr(model, 'forward')
+                except Exception:
+                    orig_forward = None
+
+                if orig_forward is not None:
+                    import pickle, torch
+
+                    def _to_cpu(x):
+                        if isinstance(x, torch.Tensor):
+                            try:
+                                return x.detach().cpu()
+                            except Exception:
+                                return x
+                        if isinstance(x, (list, tuple)):
+                            return type(x)(_to_cpu(v) for v in x)
+                        if isinstance(x, dict):
+                            return {k: _to_cpu(v) for k, v in x.items()}
+                        return x
+
+                    def _wrapped_forward(*f_args, **f_kwargs):
+                        out = orig_forward(*f_args, **f_kwargs)
+                        try:
+                            _raw_outputs.append(_to_cpu(out))
+                        except Exception:
+                            try:
+                                _raw_outputs.append(out)
+                            except Exception:
+                                pass
+                        return out
+
+                    try:
+                        model.forward = _wrapped_forward
+                        print("[stgcn_subproc] patched model.forward to capture raw outputs", file=sys.stderr)
+                    except Exception as _e:
+                        print(f"[stgcn_subproc] failed to patch model.forward: {_e}", file=sys.stderr)
+                else:
+                    print("[stgcn_subproc] model has no forward attribute to patch", file=sys.stderr)
+            else:
+                print("[stgcn_subproc] runner has no model attribute to instrument", file=sys.stderr)
+        except Exception as _e:
+            print(f"[stgcn_subproc] raw-output capture setup failed: {_e}", file=sys.stderr)
+
         runner.test()
 
         try:
@@ -352,6 +411,25 @@ def main():
             sys.stderr.flush()
         except Exception:
             pass
+
+        # If we captured any raw outputs during testing, persist them next to
+        # the primary DumpResults output so downstream tooling can inspect the
+        # model logits/probabilities. This file is optional and best-effort.
+        try:
+            if _raw_outputs:
+                import pickle, os
+                raw_path = str(args.out) + '.raw_outputs.pkl'
+                try:
+                    # Use binary pickle to preserve tensor objects (already moved to CPU)
+                    with open(raw_path, 'wb') as _f:
+                        pickle.dump(_raw_outputs, _f)
+                    print(f"[stgcn_subproc] wrote raw outputs to {raw_path}", file=sys.stderr)
+                except Exception as _e:
+                    print(f"[stgcn_subproc] failed to write raw outputs: {_e}", file=sys.stderr)
+            else:
+                print("[stgcn_subproc] no raw outputs were captured", file=sys.stderr)
+        except Exception as _e:
+            print(f"[stgcn_subproc] post-test raw-output write failed: {_e}", file=sys.stderr)
         return 0
     except Exception:
         traceback.print_exc()

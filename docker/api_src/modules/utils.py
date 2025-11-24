@@ -23,6 +23,16 @@ def debug_log(msg: str):
         pass
 
 def csv_to_pkl(csv_path: Path, out_pkl: Path):
+    # Defensive: accept either str or Path and coerce to Path so `.stem` is safe
+    try:
+        csv_path = Path(csv_path)
+    except Exception:
+        csv_path = Path(str(csv_path))
+    try:
+        out_pkl = Path(out_pkl)
+    except Exception:
+        out_pkl = Path(str(out_pkl))
+
     # 간단한 CSV->PKL 변환: 기존의 csv_to_pkl 로직을 복사해 넣으세요
     df = pd.read_csv(csv_path, encoding="utf-8-sig")
     if len(df.columns) == 1:

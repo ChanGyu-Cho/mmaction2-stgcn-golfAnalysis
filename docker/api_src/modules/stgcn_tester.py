@@ -1,623 +1,689 @@
+#!/usr/bin/env python3
 """
-ST-GCN Tester Module
-test.py와 완전히 동일한 구조로 작동하는 테스트 모듈
-Runner.from_cfg() -> runner.test() 호출 -> result.pkl 파싱 및 반환
+Simplified ST-GCN tester (finetune-style)
+
+This module provides a single entrypoint `run_stgcn_test(csv_path)` which:
+ - converts a single CSV to an annotation PKL
+ - prepares a MMAction2 test config and appends a `DumpResults` evaluator
+ - runs `Runner.test()` inline while capturing raw model outputs (logits)
+ - writes a `*.raw_full.pkl` containing DumpResults + annotations + raw_model_outputs
+ - returns a JSON-friendly dict summarizing the prediction (probs/topk/etc.)
+
+This file intentionally implements a focused, easy-to-audit flow (inspired by
+`finetune_stgcn_test.py`) rather than the previous large, multi-mode tester.
 """
-import os
-import os.path as osp
-import pickle
-import sys
-import tempfile
-import uuid
+
 from pathlib import Path
+import os
+import sys
+import uuid
+import tempfile
+import pickle
+import json
+from typing import Optional
+
+import numpy as _np
+
+# Ensure local mmaction2 in sys.path when running inside container/workspace
+REPO_ROOT = Path(__file__).resolve().parents[1]
+MMACTION2_CANDIDATE = REPO_ROOT / 'mmaction2'
+if str(MMACTION2_CANDIDATE) not in sys.path:
+    sys.path.insert(0, str(MMACTION2_CANDIDATE))
 
 from mmengine.config import Config
 from mmengine.runner import Runner
 
-# Do not import mmaction.registry at module import time. Import it later
-# after we ensure the local /mmaction2 repo is on sys.path so the registry
-# is populated from the correct package (avoids stale/site-package binding).
-from modules.utils import debug_log, csv_to_pkl
+try:
+    # helper utilities live in modules.utils in this project
+    from modules.utils import debug_log, csv_to_pkl
+except Exception:
+    # fallback trivial implementations
+    def debug_log(*args, **kwargs):
+        try:
+            print(*args, **kwargs)
+        except Exception:
+            pass
 
-# New label mapping for updated checkpoint outputs:
-# 0: worst, 1: bad, 2: normal, 3: good, 4: best
-LABEL_MAP = {
-    0: 'worst',
-    1: 'bad',
-    2: 'normal',
-    3: 'good',
-    4: 'best',
-}
+    def csv_to_pkl(csv_path, out_pkl):
+        # Very small helper: expect csv -> build simple ann.pkl with annotations list
+        # This is intentionally minimal; the project-provided csv_to_pkl is preferred.
+        import csv as _csv
+        anns = []
+        with open(csv_path, 'r', encoding='utf-8') as rf:
+            r = _csv.DictReader(rf)
+            for row in r:
+                anns.append(row)
+        obj = {'annotations': anns}
+        with open(out_pkl, 'wb') as wf:
+            pickle.dump(obj, wf, protocol=pickle.HIGHEST_PROTOCOL)
 
 
-def prepare_config_for_test(csv_path: Path):
+def _softmax(arr):
+    try:
+        a = _np.asarray(arr, dtype=float)
+        a = a - _np.max(a)
+        ex = _np.exp(a)
+        s = ex.sum() if ex.sum() != 0 else 1.0
+        return (ex / s).tolist()
+    except Exception:
+        try:
+            import math
+            arrf = [float(x) for x in arr]
+            m = max(arrf)
+            exps = [math.exp(x - m) for x in arrf]
+            s = sum(exps) if sum(exps) != 0 else 1.0
+            return [e / s for e in exps]
+        except Exception:
+            return None
+
+
+def _ensure_repo_registration():
+    """Try to register mmaction modules (best-effort)."""
+    try:
+        try:
+            from mmaction.utils import register_all_modules
+        except Exception:
+            from mmaction.utils.setup_env import register_all_modules
+        register_all_modules(init_default_scope=True)
+        debug_log("Registered mmaction modules (best-effort)")
+    except Exception as _e:
+        debug_log(f"Warning: failed to register mmaction modules: {_e}")
+
+
+def prepare_config_for_test(csv_path: Path) -> tuple:
+    """Prepare a minimal test config and write ann/result PKL paths.
+
+    Returns (cfg, ann_pkl_path, result_pkl_path)
     """
-    test.py의 parse_args()와 merge_args() 역할을 수행
-    CSV 파일을 받아서 config를 준비하고 필요한 설정을 오버라이드
-    """
-    # 1. Config 파일 경로 (my_stgcnpp.py)
-    config_path = Path(__file__).parent / "my_stgcnpp.py"
-    checkpoint_path = None
-    
-    # checkpoint 경로 찾기
-    for p in [
-        Path(__file__).parent.parent / "model.pth"
-    ]:
-        if Path(p).exists():
-            checkpoint_path = str(p)
-            break
-    
-    if checkpoint_path is None:
-        raise FileNotFoundError("checkpoint file stgcnpp_8xb16-joint-u100-80e_ntu60-xsub-keypoint-2d_20221228-86e1e77a.pth not found")
-    
-    debug_log(f"Using config: {config_path}")
-    debug_log(f"Using checkpoint: {checkpoint_path}")
-    
-    # 2. CSV를 ann.pkl로 변환
-    unique_id = uuid.uuid4().hex[:8]
-    # Prefer workspace-local results directory so files are visible outside the container
     repo_results_dir = Path(__file__).parent / 'results'
     try:
         repo_results_dir.mkdir(parents=True, exist_ok=True)
     except Exception:
-        # fallback to system tempdir
         repo_results_dir = Path(tempfile.gettempdir())
 
+    unique_id = uuid.uuid4().hex[:8]
     ann_pkl_path = repo_results_dir / f"test_ann_{unique_id}.pkl"
-    debug_log(f"Converting CSV to PKL: {csv_path} -> {ann_pkl_path}")
-    csv_to_pkl(csv_path, ann_pkl_path)
-    
-    # 3. result.pkl 경로 설정
     result_pkl_path = repo_results_dir / f"test_result_{unique_id}.pkl"
-    
-    # Make sure local mmaction2 package is importable so model classes (e.g. RecognizerGCN)
-    # are registered before loading the config. We try the repo-local path and the
-    # container path '/mmaction2'.
-    repo_dir = Path(__file__).parent
-    candidate = repo_dir.parent / "mmaction2"
+
+    # Convert CSV to PKL using project helper (preferred)
+    debug_log(f"Converting CSV to PKL: {csv_path} -> {ann_pkl_path}")
+    # csv_to_pkl in modules.utils expects Path-like objects so pass Paths (not str)
     try:
-        if candidate.exists():
-            sys.path.insert(0, str(candidate))
-        else:
-            # fallback to container path
-            sys.path.insert(0, "/mmaction2")
+        csv_to_pkl(Path(csv_path), Path(ann_pkl_path))
+    except TypeError:
+        # fallback: if csv_to_pkl expects strings in some environments, try str
+        csv_to_pkl(str(csv_path), str(ann_pkl_path))
+
+    # Load config file from same directory as this module (`my_stgcnpp.py`)
+    config_path = Path(__file__).parent / 'my_stgcnpp.py'
+    if not config_path.exists():
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+
+    cfg = Config.fromfile(str(config_path))
+
+    # Set ann_file and result dump
+    try:
+        if hasattr(cfg, 'test_dataloader'):
+            try:
+                cfg.test_dataloader.dataset.ann_file = str(ann_pkl_path)
+            except Exception:
+                try:
+                    cfg.test_dataloader['dataset']['ann_file'] = str(ann_pkl_path)
+                except Exception:
+                    pass
     except Exception:
         pass
 
-    # Ensure mmaction registers its modules (models, datasets, etc.).
-    # Some mmaction registration happens when importing subpackages; call
-    # register_all_modules if available to guarantee registries are populated.
+    # Ensure a checkpoint is provided via cfg or environment
+    checkpoint = os.environ.get('MMACTION_CHECKPOINT')
+    if checkpoint:
+        cfg.load_from = checkpoint
+
+    # Append DumpResults evaluator
+    dump_metric = dict(type='DumpResults', out_file_path=str(result_pkl_path))
     try:
-        import mmaction  # noqa: F401
-        try:
-            # mmaction provides a helper to register all modules
-            from mmaction.utils.setup_env import register_all_modules
-            register_all_modules(init_default_scope=True)
-            # Debug: list some registered model keys to verify GCN is present
+        if isinstance(cfg.test_evaluator, (list, tuple)):
+            cfg.test_evaluator = list(cfg.test_evaluator)
+            cfg.test_evaluator = [e for e in cfg.test_evaluator if e.get('type') != 'DumpResults']
+            cfg.test_evaluator.append(dump_metric)
+        else:
+            cfg.test_evaluator = [cfg.test_evaluator, dump_metric]
+    except Exception:
+        cfg.test_evaluator = [dump_metric]
+
+    # Inline/run settings
+    cfg.launcher = 'none'
+    try:
+        # force deterministic single-sample inference
+        if isinstance(cfg.test_dataloader, dict):
+            cfg.test_dataloader['batch_size'] = 1
+            cfg.test_dataloader['num_workers'] = 0
+            cfg.test_dataloader['persistent_workers'] = False
+        else:
             try:
-                from mmaction.registry import MODELS
-                model_keys = list(MODELS.module_dict.keys()) if hasattr(MODELS, 'module_dict') else []
-                debug_log(f"Registered MODELS sample (len={len(model_keys)}): {model_keys[:50]}")
-                debug_log(f"RecognizerGCN registered? {'RecognizerGCN' in model_keys}")
-            except Exception as _e:
-                debug_log(f"Failed to inspect MODELS registry: {_e}")
-        except Exception:
-            # Fallback: at least import models subpackage to trigger module imports
-            try:
-                import mmaction.models  # noqa: F401
-                # Try to inspect MODELS registry even if register_all_modules unavailable
-                try:
-                    from mmaction.registry import MODELS
-                    model_keys = list(MODELS.module_dict.keys()) if hasattr(MODELS, 'module_dict') else []
-                    debug_log(f"Registered MODELS sample (fallback) (len={len(model_keys)}): {model_keys[:50]}")
-                    debug_log(f"RecognizerGCN registered? {'RecognizerGCN' in model_keys}")
-                except Exception as _e:
-                    debug_log(f"Failed to inspect MODELS registry in fallback: {_e}")
+                cfg.test_dataloader.batch_size = 1
+                cfg.test_dataloader.num_workers = 0
+                cfg.test_dataloader.persistent_workers = False
             except Exception:
-                # swallow; Config.fromfile() will still run and may raise a helpful error
                 pass
     except Exception:
-        # If mmaction cannot be imported at all, let Config.fromfile raise later
         pass
 
-    # 4. Config 로드
-    cfg = Config.fromfile(str(config_path))
-    # Debug: what model type is requested in config
+    # Ensure cfg.work_dir exists - Runner.from_cfg expects cfg['work_dir'] to be present
     try:
-        cfg_model_type = cfg.model.type if hasattr(cfg, 'model') and isinstance(cfg.model, dict) and 'type' in cfg.model else getattr(cfg.model, 'type', None)
-        debug_log(f"Config model.type -> {cfg_model_type}")
-    except Exception as _e:
-        debug_log(f"Failed to read cfg.model.type: {_e}")
-    
-    # 5. test.py의 merge_args와 동일한 설정 적용
-    # work_dir 설정 (test.py와 동일한 우선순위)
-    if cfg.get('work_dir', None) is None:
-        cfg.work_dir = osp.join('/tmp/work_dirs', 
-                               osp.splitext(osp.basename(str(config_path)))[0])
-    
-    # 6. checkpoint 로드 설정
-    cfg.load_from = checkpoint_path
-    
-    # 7. test_dataloader의 ann_file 오버라이드 및 전처리 파이프라인 수정
-    cfg.test_dataloader.dataset.ann_file = str(ann_pkl_path)
-    
-    # ----------------------------------------------------------------------
-    # ⭐️ 핵심 수정 사항: 0-to-1 정규화 전처리 파이프라인 추가 (finetune과 동일)
-    # ----------------------------------------------------------------------
-    
-    # test_dataloader에서 사용할 파이프라인을 복사하거나 가져옵니다.
-    test_pipeline = cfg.test_dataloader.dataset.pipeline
-    
-    # 0-to-1 정규화 클래스 (NormalizeIMSkeleton)를 찾거나 새로 정의합니다.
-    # 일반적으로 NTU-RGB+D 데이터셋에서 사용되는 정규화입니다.
-    # 'keypoint' 필드에 대해 mean과 std를 0으로 설정하여 (x - 0) / 1.0 = x 를 수행한 후,
-    # C=2 (x, y)를 V (관절 수)로 나누고 V를 1.0으로 나눕니다.
-    # 실제로 0-to-1 정규화의 목적은 min-max 스케일링이 아니라
-    # 포즈 데이터의 특정 축을 1.0으로 스케일링하여 정규화하는 방식(NTU60의 일반적인 방식)이거나
-    # 단순히 데이터의 스케일을 1로 만드는 것일 수 있습니다.
-    # 여기서는 finetune에 사용된 일반적인 PoseDataset의 Normalize 파이프라인을 추가합니다.
-
-    # 1. 'Normalize' (0-to-1) 스텝을 확인합니다.
-    # 'NormalizeIMSkeleton'을 사용하면 finetune_stgcn_test에서 사용한
-    # mean=0, std=1.0 처리를 간소화할 수 있습니다.
-    
-    # NOTE: 만약 finetune의 전처리가 단순히 각 채널을 [0, 1]로 나누는 min/max 방식이 아닌,
-    # NTU의 center-normalize + unit-length 방식이라면,
-    # 해당 로직을 수행하는 Transform (예: NormalizeIMSkeleton)을 삽입해야 합니다.
-    # 여기서는 finetune 시 사용했을 것으로 추정되는 'NormalizeIMSkeleton'을 추가하고,
-    # 파인튜닝 시 사용된 옵션(mean, std)이 필요하다면 해당 값으로 Normalize를 추가합니다.
-
-    # 일반적으로 ST-GCN의 전처리는 포즈 데이터에 대한 Mean/Std 정규화가 아니라
-    # (x, y) 좌표를 [0, 1] 범위로 스케일링하거나, 스켈레톤의 중앙을 맞추는 등의 작업이 포함됩니다.
-    # finetune_stgcn_test에서 "0to1 정규화"를 사용했다면,
-    # 그 전처리는 PoseDataset에 포함된 `keypoint` 전처리입니다.
-
-    # 'PoseDataset'의 Pipeline 구성 요소:
-    # 1) GeneratePoseTarget -> 2) FormatShape -> 3) (Optional) Normalize/Convert
-    # FormatShape 뒤에 'Normalize'를 추가합니다.
-
-    normalize_step = dict(type='NormalizeIMSkeleton',
-                          mean=[100, 100],
-                          std=[100, 100],
-                          to_bgr=False)
-    
-    # FormatShape 이후에 NormalizeIMSkeleton을 삽입합니다.
-    try:
-        format_shape_idx = -1
-        for i, step in enumerate(test_pipeline):
-            # FormatShape 다음이나 마지막 부분에 삽입
-            if isinstance(step, dict) and step.get('type') == 'FormatShape':
-                format_shape_idx = i
-                break
-        
-        # FormatShape 다음 (i+1) 위치에 삽입
-        if format_shape_idx != -1:
-            test_pipeline.insert(format_shape_idx + 1, normalize_step)
-            debug_log("Inserted 'NormalizeIMSkeleton' after 'FormatShape'.")
+        if getattr(cfg, 'get', None) is not None:
+            # mmengine.Config supports .get like dict-like access
+            if cfg.get('work_dir', None) is None:
+                cfg.work_dir = str(repo_results_dir / f"work_dir_{unique_id}")
         else:
-            # FormatShape이 없으면 파이프라인의 끝에 추가 (안전 장치)
-            test_pipeline.append(normalize_step)
-            debug_log("Inserted 'NormalizeIMSkeleton' at the end of the pipeline.")
-
-    except Exception as e:
-        debug_log(f"Warning: Failed to insert NormalizeIMSkeleton: {e}")
-        # 예외 발생 시 파이프라인의 맨 뒤에 추가하여 시도
-        test_pipeline.append(normalize_step)
-
-
-    # 8. DumpResults 설정 (test.py의 --dump 옵션과 동일)
-    dump_metric = dict(type='DumpResults', out_file_path=str(result_pkl_path))
-    if isinstance(cfg.test_evaluator, (list, tuple)):
-        cfg.test_evaluator = list(cfg.test_evaluator)
-        # 기존 DumpResults가 있으면 제거
-        cfg.test_evaluator = [e for e in cfg.test_evaluator if e.get('type') != 'DumpResults']
-        cfg.test_evaluator.append(dump_metric)
-    else:
-        cfg.test_evaluator = [cfg.test_evaluator, dump_metric]
-    
-    # 9. launcher 설정
-    cfg.launcher = 'none'
-    
-    # 10. 환경 설정 (안정성을 위해)
-    if hasattr(cfg, 'env_cfg'):
-        if hasattr(cfg.env_cfg, 'mp_cfg'):
-            cfg.env_cfg.mp_cfg.mp_start_method = 'fork'
-        if hasattr(cfg.env_cfg, 'dist_cfg'):
-            cfg.env_cfg.dist_cfg.backend = 'gloo'
-    
-    # 11. visualization 비활성화 (서버 환경에서 불필요)
-    if hasattr(cfg, 'default_hooks') and isinstance(cfg.default_hooks, dict):
-        if 'visualization' in cfg.default_hooks:
-            cfg.default_hooks.visualization.enable = False
-    
-    debug_log(f"Config prepared: work_dir={cfg.work_dir}")
-    debug_log(f"Result will be saved to: {result_pkl_path}")
-    
-    return cfg, ann_pkl_path, result_pkl_path
-
-
-def run_stgcn_test(csv_path: Path):
-    """
-    test.py의 main() 함수와 완전히 동일한 구조
-    1. Config 로드 및 설정
-    2. Runner 생성
-    3. runner.test() 실행
-    4. result.pkl 파싱 및 반환
-    """
-    debug_log(f"run_stgcn_test start: {csv_path}")
-
-    ann_pkl_path = None
-    result_pkl_path = None
-
-    try:
-        # 1) Prepare config and temporary files
-        cfg, ann_pkl_path, result_pkl_path = prepare_config_for_test(csv_path)
-
-        # 2) Choose execution mode: inline (default) or subprocess when explicitly requested
-        use_subproc = os.environ.get('MMACTION_USE_SUBPROCESS', '0') == '1'
-        if use_subproc:
-            debug_log("MMACTION_USE_SUBPROCESS=1 -> running stgcn_subproc in subprocess")
-            import subprocess, tempfile
-
-            subproc_script = Path(__file__).parent / "stgcn_subproc.py"
-            env = os.environ.copy()
-            repo_dir = Path(__file__).parent.parent
-            candidate = repo_dir / "mmaction2"
-            env_pythonpath = str(candidate) if candidate.exists() else "/mmaction2"
-            if env.get('PYTHONPATH'):
-                env['PYTHONPATH'] = env_pythonpath + os.pathsep + env['PYTHONPATH']
-            else:
-                env['PYTHONPATH'] = env_pythonpath
-
-            cmd = [
-                sys.executable,
-                str(subproc_script),
-                '--config', str(Path(__file__).parent / 'my_stgcnpp.py'),
-                '--checkpoint', str(cfg.load_from),
-                '--ann', str(ann_pkl_path),
-                '--out', str(result_pkl_path),
-            ]
-
-            cuda_env = os.environ.get('CUDA_VISIBLE_DEVICES')
-            if cuda_env:
-                env['CUDA_VISIBLE_DEVICES'] = cuda_env
-                debug_log(f"Forwarding CUDA_VISIBLE_DEVICES={cuda_env} to subprocess")
-            mma_device = os.environ.get('MMACTION_DEVICE')
-            if mma_device:
-                cmd += ['--device', mma_device]
-                debug_log(f"Passing device='{mma_device}' to subprocess")
-
-            debug_log(f"Running subprocess: {cmd} with PYTHONPATH={env['PYTHONPATH']}")
-            out_log = Path(tempfile.gettempdir()) / f"stgcn_subproc_{uuid.uuid4().hex[:8]}.stdout.log"
-            err_log = Path(tempfile.gettempdir()) / f"stgcn_subproc_{uuid.uuid4().hex[:8]}.stderr.log"
-            debug_log(f"Subprocess stdout redirected to: {out_log}")
-            debug_log(f"Subprocess stderr redirected to: {err_log}")
-
-            with open(out_log, 'wb') as _outf, open(err_log, 'wb') as _errf:
-                proc = subprocess.Popen(cmd, stdout=_outf, stderr=_errf, env=env)
-                try:
-                    proc.wait(timeout=600)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    debug_log("Subprocess timed out and was killed")
-                    try:
-                        debug_log(f"subproc stdout (partial):\n{out_log.read_text(errors='replace')}")
-                        debug_log(f"subproc stderr (partial):\n{err_log.read_text(errors='replace')}")
-                    except Exception:
-                        pass
-                    raise RuntimeError("stgcn_subproc timed out")
-
-            try:
-                out_text = out_log.read_text(errors='replace')
-                err_text = err_log.read_text(errors='replace')
-                max_len = 10000
-                debug_log(f"subproc stdout (tail):\n{out_text[-max_len:]}")
-                debug_log(f"subproc stderr (tail):\n{err_text[-max_len:]}")
-            except Exception as _e:
-                debug_log(f"Failed to read subproc logs: {_e}")
-
-            if proc.returncode != 0:
-                raise RuntimeError(f"stgcn_subproc failed (exit {proc.returncode}); see logs: {err_log}")
-
-            debug_log("Subprocess completed successfully")
-            if not result_pkl_path.exists():
-                raise FileNotFoundError(f"Result file not found: {result_pkl_path}")
-            debug_log(f"Loading result from: {result_pkl_path}")
-            with open(result_pkl_path, "rb") as f:
-                result_data = pickle.load(f)
-            parsed_result = parse_test_result(result_data)
-            debug_log(f"Test completed successfully: {parsed_result}")
-            return parsed_result
-
-        # Inline execution (default)
-        debug_log("Running ST-GCN test inline (same process)")
-
-        # Ensure local repo on sys.path
+            # fallback attribute access
+            if not hasattr(cfg, 'work_dir') or cfg.work_dir in (None, ''):
+                cfg.work_dir = str(repo_results_dir / f"work_dir_{unique_id}")
+    except Exception:
         try:
-            repo_dir = Path(__file__).parent.parent
-            candidate = repo_dir / "mmaction2"
-            if candidate.exists() and str(candidate) not in sys.path:
-                sys.path.insert(0, str(candidate))
-            elif "/mmaction2" not in sys.path:
-                sys.path.insert(0, "/mmaction2")
+            cfg.work_dir = str(repo_results_dir)
         except Exception:
             pass
 
-        # Register modules and sync registries
+    try:
+        debug_log(f"Using cfg.work_dir={getattr(cfg, 'work_dir', None)}")
+    except Exception:
+        pass
+
+    # Defensive: ensure returned paths are Path objects
+    try:
+        ann_pkl_path = Path(ann_pkl_path)
+    except Exception:
+        ann_pkl_path = Path(str(ann_pkl_path))
+    try:
+        result_pkl_path = Path(result_pkl_path)
+    except Exception:
+        result_pkl_path = Path(str(result_pkl_path))
+
+    debug_log(f"Prepared config; result will be written to: {result_pkl_path}")
+    return cfg, ann_pkl_path, result_pkl_path
+
+
+def _to_numpy_safe(x):
+    try:
+        import torch as _torch
+        if isinstance(x, _torch.Tensor):
+            return x.detach().cpu().numpy()
+    except Exception:
+        pass
+    try:
+        if isinstance(x, _np.ndarray):
+            return x
+    except Exception:
+        pass
+    if isinstance(x, (list, tuple)):
         try:
-            try:
-                from mmaction.utils import register_all_modules
-            except Exception:
-                try:
-                    from mmaction.utils.setup_env import register_all_modules
-                except Exception:
-                    register_all_modules = None
-            if register_all_modules:
-                register_all_modules(init_default_scope=True)
+            return _np.asarray(x)
         except Exception:
-            debug_log("Warning: register_all_modules failed in inline mode")
-
-        try:
-            # Explicitly import dataset modules that perform registration as a side-effect.
-            try:
-                import mmaction.datasets.pose_dataset  # noqa: F401
-                debug_log("Imported mmaction.datasets.pose_dataset in inline mode")
-            except Exception as _e:
-                debug_log(f"Failed to import mmaction.datasets.pose_dataset: {_e}")
-
-            import importlib
-            import mmengine.registry as _me_reg
-            mma_reg = importlib.import_module('mmaction.registry')
-            # Sync additional registries including METRICS and EVALUATOR which
-            # are needed to build evaluators like AccMetric.
-            for reg_name in ('MODELS', 'DATASETS', 'TRANSFORMS', 'METRICS', 'EVALUATOR'):
-                mma_reg_obj = getattr(mma_reg, reg_name, None)
-                me_reg_obj = getattr(_me_reg, reg_name, None)
-                if mma_reg_obj is None or me_reg_obj is None:
-                    debug_log(f"Registry {reg_name} missing in mmaction or mmengine; skipping")
-                    continue
-                mma_dict = getattr(mma_reg_obj, 'module_dict', {}) or {}
-                me_dict = getattr(me_reg_obj, 'module_dict', {}) or {}
-                added = 0
-                for name, cls in mma_dict.items():
-                    if name not in me_dict:
-                        try:
-                            me_reg_obj.register_module(module=cls, name=name, force=True)
-                            added += 1
-                        except Exception as _e:
-                            debug_log(f"Failed to register {name} into mmengine.{reg_name}: {_e}")
-                debug_log(f"Synchronized {added} entries into mmengine.{reg_name} (inline)")
-        except Exception as _e:
-            debug_log(f"Registry sync failed in inline mode: {_e}")
-
-        # Build and run
-        try:
-            runner = Runner.from_cfg(cfg)
-            runner.test()
-        except Exception:
-            import traceback as _tb
-            debug_log("Inline runner.test() raised an exception:\n" + _tb.format_exc())
-            raise
-
-        if not result_pkl_path.exists():
-            raise FileNotFoundError(f"Result file not found: {result_pkl_path}")
-        with open(result_pkl_path, "rb") as f:
-            result_data = pickle.load(f)
-        parsed_result = parse_test_result(result_data)
-        debug_log(f"Inline test completed successfully: {parsed_result}")
-        return parsed_result
-    finally:
-        # cleanup temporary files created during test
-        try:
-            if ann_pkl_path and Path(ann_pkl_path).exists():
-                Path(ann_pkl_path).unlink()
-                debug_log(f"Cleaned up: {ann_pkl_path}")
-        except Exception as _e:
-            debug_log(f"Failed to cleanup {ann_pkl_path}: {_e}")
-        # By default we clean up the result PKL. If an operator wants to keep
-        # the result file for debugging/inspection, set the environment
-        # variable MMACTION_PRESERVE_RESULT=1 (or true).
-        try:
-            preserve = str(os.environ.get('MMACTION_PRESERVE_RESULT', '0')).lower() in ('1', 'true', 'yes')
-            if result_pkl_path and Path(result_pkl_path).exists():
-                # Before deleting (or even if preserving), write a human-readable
-                # log file next to the PKL so operators can inspect the parsed
-                # result without requiring pickle loading.
-                try:
-                    import json
-                    import numpy as _np
-
-                    def _safe_convert(obj):
-                        # Convert numpy arrays and other non-JSON-able items
-                        if isinstance(obj, (bytes, bytearray)):
-                            return obj.decode('utf-8', errors='replace')
-                        if isinstance(obj, _np.ndarray):
-                            return obj.tolist()
-                        if isinstance(obj, ( _np.generic, )):
-                            return obj.item()
-                        # fallback to string
-                        try:
-                            json.dumps(obj)
-                            return obj
-                        except Exception:
-                            return str(obj)
-
-                    # Try to load parsed result (if available in this scope).
-                    # We'll attempt to read the PKL raw if parsed_result isn't present.
-                    parsed_to_dump = None
-                    try:
-                        # if result_data was left in local scope earlier, use parsed_result
-                        parsed_to_dump = parsed_result if 'parsed_result' in locals() else None
-                    except Exception:
-                        parsed_to_dump = None
-
-                    if parsed_to_dump is None:
-                        # Attempt to load pickled data and create a safe representation
-                        try:
-                            with open(result_pkl_path, 'rb') as _f:
-                                _raw = pickle.load(_f)
-                            # If it's a list/dict, try to convert elements
-                            def _normalize(o):
-                                if isinstance(o, dict):
-                                    return {k: _normalize(v) for k, v in o.items()}
-                                if isinstance(o, list):
-                                    return [_normalize(x) for x in o]
-                                return _safe_convert(o)
-                            parsed_to_dump = _normalize(_raw)
-                        except Exception as _e:
-                            parsed_to_dump = {"_load_error": str(_e)}
-
-                    log_path = Path(str(result_pkl_path) + '.log')
-                    try:
-                        with open(log_path, 'w', encoding='utf-8') as _logf:
-                            json.dump(parsed_to_dump, _logf, ensure_ascii=False, indent=2)
-                        debug_log(f"Wrote human-readable result log: {log_path}")
-                    except Exception as _e:
-                        debug_log(f"Failed to write result log {log_path}: {_e}")
-
-                except Exception as _e:
-                    debug_log(f"Unexpected error while preparing result log: {_e}")
-
-                # NOTE: Changed behavior per request: do NOT delete the result PKL.
-                # Always preserve the PKL so operators can inspect it directly.
-                debug_log(f"Preserving result PKL (no deletion performed): {result_pkl_path}")
-        except Exception as _e:
-            debug_log(f"Failed to cleanup {result_pkl_path}: {_e}")
+            return None
+    return None
 
 
-def parse_test_result(result_data):
-    """Parse result.pkl produced by DumpResults into a friendly dict.
+def _format_row(arr, max_items=100):
+    """Return a short string preview of numeric array `arr` for logging.
 
-    Returns a dict with keys: status, num_samples, predictions (list).
-    Each prediction contains sample_index, scores (optional), predicted_class,
-    and ground_truth_class (if present).
+    Truncates long arrays and formats floats with limited precision.
     """
-    if not isinstance(result_data, list):
-        debug_log(f"Unexpected result format: {type(result_data)}")
-        return {
-            "status": "error",
-            "message": "Unexpected result format",
-            "raw_type": str(type(result_data)),
-        }
-
-    if len(result_data) == 0:
-        return {
-            "status": "success",
-            "num_samples": 0,
-            # Single-sample pipeline: no prediction available
-            "prediction": None,
-            "debug": {
-                "note": "no samples in result_data"
-            }
-        }
-
-    # This function assumes a single-sample pipeline. If multiple results are
-    # present, only the first sample will be processed and a note will be
-    # included in the debug output.
-    if len(result_data) > 1:
-        debug_log(f"parse_test_result: received {len(result_data)} samples; processing only the first one")
-
-    item = result_data[0]
-
-    # Prepare default debug output
-    debug_info = {
-        "processed_sample_index": 0,
-        "note": None,
-    }
-
-    if not isinstance(item, dict):
-        debug_info["note"] = "first item is not a dict; cannot extract prediction"
-        return {
-            "status": "success",
-            "num_samples": len(result_data),
-            "prediction": None,
-            "debug": debug_info,
-        }
-
-    # Extract prediction index and raw scores where available
-    pred_idx = None
-    raw_scores = None
-    if 'pred_label' in item:
+    try:
+        a = _to_numpy_safe(arr)
+        if a is None:
+            return repr(arr)
+        # flatten
         try:
-            pred_idx = int(item['pred_label'])
+            flat = a.flatten()
         except Exception:
-            pred_idx = None
-    if pred_idx is None and 'pred_labels' in item:
-        try:
-            val = item['pred_labels']
-            if isinstance(val, (list, tuple)) and len(val) > 0:
-                pred_idx = int(val[0])
-            else:
-                pred_idx = int(val)
-        except Exception:
-            pred_idx = None
-    # Try multiple key names that may contain model outputs/scores/logits
-    score_keys = ['pred_scores', 'pred_score', 'scores', 'score', 'logits', 'outputs', 'pred_logits', 'output']
-    for k in score_keys:
-        if k in item and raw_scores is None:
-            try:
-                import numpy as _np
-                raw_scores = _np.asarray(item[k], dtype=float)
-                if pred_idx is None and raw_scores.size > 0:
-                    pred_idx = int(_np.argmax(raw_scores))
+            flat = _np.asarray(a)
+        L = int(getattr(flat, 'size', len(flat) if hasattr(flat, '__len__') else 0))
+        preview = []
+        for i, v in enumerate(flat.tolist() if hasattr(flat, 'tolist') else list(flat)):
+            if i >= max_items:
                 break
-            except Exception:
-                raw_scores = None
-
-    # Compute softmax probabilities if we have raw_scores
-    probs = None
-    topk = None
-    confidence = None
-    if raw_scores is not None:
-        try:
-            import numpy as _np
-            # stable softmax
-            rs = _np.asarray(raw_scores, dtype=float)
-            ex = _np.exp(rs - _np.max(rs))
-            probs_arr = ex / _np.sum(ex)
-            probs = probs_arr.tolist()
-            # top-k (k=5 or number of classes)
-            k = min(5, probs_arr.size)
-            idx_sorted = list(_np.argsort(probs_arr)[::-1])
-            topk = []
-            for i in idx_sorted[:k]:
-                topk.append({
-                    "index": int(i),
-                    "label": LABEL_MAP.get(int(i), int(i)),
-                    "prob": float(probs_arr[int(i)])
-                })
-            if pred_idx is not None and 0 <= pred_idx < len(probs_arr):
-                confidence = float(probs_arr[pred_idx])
-            # Emit a compact debug line so this information appears in logs
             try:
-                dbg_topk = [{
-                    'index': int(x['index']),
-                    'label': x['label'],
-                    'prob': float(x['prob'])
-                } for x in topk] if topk else None
-                debug_log(f"parse_test_result: pred_index={pred_idx}, prediction={LABEL_MAP.get(pred_idx, pred_idx)}, confidence={confidence}, topk={dbg_topk}")
+                preview.append(f"{float(v):.6g}")
             except Exception:
-                # swallow logging error
-                pass
+                preview.append(repr(v))
+        tail = '...' if L > max_items else ''
+        return f"len={L} [{', '.join(preview)}]{tail}"
+    except Exception:
+        try:
+            return repr(arr)
         except Exception:
-            probs = None
-            topk = None
-            confidence = None
+            return '<unprintable>'
 
-    # Map pred_idx to label if available
-    pred_label = LABEL_MAP.get(pred_idx, pred_idx) if pred_idx is not None else None
 
-    result = {
-        "status": "success",
-        "num_samples": len(result_data),
-        # Single-sample pipeline convenience field
-        "prediction": pred_label,
-        "pred_index": pred_idx,
-        "raw_scores": (raw_scores.tolist() if raw_scores is not None else None),
-        "probs": probs,
-        "confidence": confidence,
-        "topk": topk,
-        "debug": debug_info,
-    }
+def _to_json_safe(obj):
+    """Recursively convert objects into JSON-serializable Python types.
 
-    return result
+    - torch.Tensor -> list
+    - numpy.ndarray -> list
+    - numpy scalars -> Python scalars
+    - Path -> str
+    - dict/list/tuple -> recursively converted
+    - other unknown objects -> repr(obj)
+    """
+    try:
+        # avoid heavy imports at module import time
+        import torch as _torch
+        if isinstance(obj, _torch.Tensor):
+            try:
+                return obj.detach().cpu().tolist()
+            except Exception:
+                return None
+    except Exception:
+        pass
+
+    try:
+        import numpy as _npy
+        if isinstance(obj, _npy.ndarray):
+            try:
+                return obj.tolist()
+            except Exception:
+                # fall through
+                pass
+        if isinstance(obj, (_npy.generic,)):
+            try:
+                return obj.item()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # basic types
+    if obj is None or isinstance(obj, (str, bool, int, float)):
+        return obj
+
+    # containers
+    if isinstance(obj, (list, tuple)):
+        return [_to_json_safe(x) for x in obj]
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            try:
+                key = k if isinstance(k, str) else str(k)
+            except Exception:
+                key = repr(k)
+            out[key] = _to_json_safe(v)
+        return out
+
+    # Path -> str
+    try:
+        from pathlib import Path as _Path
+        if isinstance(obj, _Path):
+            return str(obj)
+    except Exception:
+        pass
+
+    # numpy scalar handled above; for other scalars try to cast
+    try:
+        # attempt to extract .item() if present
+        if hasattr(obj, 'item') and callable(getattr(obj, 'item')):
+            return obj.item()
+    except Exception:
+        pass
+
+    # bytes
+    try:
+        if isinstance(obj, (bytes, bytearray)):
+            try:
+                return obj.decode('utf-8')
+            except Exception:
+                return repr(obj)
+    except Exception:
+        pass
+
+    # Fallback: string representation
+    try:
+        return repr(obj)
+    except Exception:
+        return None
+
+
+def _find_logits_from_raw(raw):
+    # Try to find a numeric vector in captured raw outputs
+    if raw is None:
+        return None
+    candidate = None
+    if isinstance(raw, (list, tuple)) and len(raw) > 0:
+        for e in raw:
+            if e is not None:
+                candidate = e
+                break
+    else:
+        candidate = raw
+
+    if candidate is None:
+        return None
+
+    # If it's an ndarray-like
+    try:
+        if isinstance(candidate, _np.ndarray):
+            return candidate
+    except Exception:
+        pass
+
+    # If it's a dict, check common keys
+    if isinstance(candidate, dict):
+        for key in ('logits', 'outputs', 'pred_scores', 'scores', 'probs'):
+            if key in candidate:
+                arr = _to_numpy_safe(candidate[key])
+                if arr is not None and arr.size >= 2:
+                    return arr
+        # fallback: check values
+        for v in candidate.values():
+            arr = _to_numpy_safe(v)
+            if arr is not None and getattr(arr, 'size', 0) >= 2:
+                return arr
+
+    # If it's list/tuple, try first array-like
+    if isinstance(candidate, (list, tuple)):
+        for v in candidate:
+            arr = _to_numpy_safe(v)
+            if arr is not None and getattr(arr, 'size', 0) >= 2:
+                return arr
+        arr = _to_numpy_safe(candidate)
+        if arr is not None and getattr(arr, 'size', 0) >= 2:
+            return arr
+
+    return None
+
+
+def parse_result(result_data, raw_model_outputs: Optional[list]):
+    """Produce a JSON-friendly summary from DumpResults + raw outputs.
+
+    Returns a dict with fields: status, orig_pred_index, raw_probs, probs, topk
+    """
+    try:
+        # normalize result_data
+        if not isinstance(result_data, list):
+            return {"status": "error", "message": "unexpected result format"}
+
+        first = result_data[0] if result_data else None
+        raw_probs = None
+        probs = None
+        orig_idx = None
+
+        # prefer raw_model_outputs if available
+        if raw_model_outputs:
+            cand = _find_logits_from_raw(raw_model_outputs)
+            if cand is not None:
+                try:
+                    arr = cand.flatten()
+                except Exception:
+                    arr = cand
+                # Preserve raw numeric outputs for debugging; do NOT auto-apply softmax here.
+                try:
+                    raw_probs = arr.tolist() if hasattr(arr, 'tolist') else list(arr)
+                except Exception:
+                    raw_probs = None
+                # log raw row preview for debugging
+                try:
+                    debug_log(f"RAW ROW from model outputs: {_format_row(arr, max_items=200)}")
+                except Exception:
+                    pass
+                # Do not compute `probs` or derive orig_idx via argmax automatically
+                # as that forces one-hot/int-like behavior which hides raw values.
+
+        # fallback: inspect DumpResults first item
+        if probs is None and isinstance(first, dict):
+            for k in ('pred_scores', 'pred_score', 'scores', 'score', 'probs', 'logits', 'outputs'):
+                if k in first:
+                    v = first.get(k)
+                    arr = _to_numpy_safe(v)
+                    if arr is not None and getattr(arr, 'size', 0) > 0:
+                        raw_probs = arr.tolist() if hasattr(arr, 'tolist') else list(arr)
+                        # if values sum ~1, treat as probs
+                        try:
+                            s = float(_np.sum(arr))
+                        except Exception:
+                            s = None
+                        if s is not None and abs(s - 1.0) < 1e-3:
+                            probs = [float(x) for x in arr.tolist()]
+                            try:
+                                debug_log(f"RAW ROW from DumpResults (sum~1): {_format_row(arr, max_items=200)}")
+                            except Exception:
+                                pass
+                        else:
+                            # raw numeric values present in DumpResults; log them for debugging
+                            try:
+                                debug_log(f"RAW ROW from DumpResults (not normalized): {_format_row(arr, max_items=200)}")
+                            except Exception:
+                                pass
+                        # Do NOT auto-apply softmax for logits/outputs; keep raw values
+                        break
+
+        # compute topk
+        topk = None
+        confidence = None
+        if probs is not None:
+            try:
+                idxs = list(_np.argsort(_np.asarray(probs))[::-1])
+                topk = [{"index": int(i), "prob": float(probs[int(i)])} for i in idxs[:min(5, len(idxs))]]
+                confidence = float(probs[int(idxs[0])]) if idxs else None
+            except Exception:
+                topk = None
+
+        # orig_pred_index try to fill from DumpResults
+        if orig_idx is None and isinstance(first, dict):
+            if 'pred_label' in first:
+                try:
+                    orig_idx = int(first.get('pred_label'))
+                except Exception:
+                    orig_idx = None
+            elif 'pred_labels' in first:
+                try:
+                    pl = first.get('pred_labels')
+                    if isinstance(pl, (list, tuple)) and pl:
+                        orig_idx = int(pl[0])
+                    else:
+                        orig_idx = int(pl)
+                except Exception:
+                    orig_idx = None
+
+        # Map 5-class -> 2-class as finetune_stgcn_test does: {0,1,2} -> 0 ; {3,4} -> 1
+        pred_index = None
+        reduced_confidence = None
+        binary_probs = None
+        try:
+            # Prefer mapping from explicit original predicted label if available
+            if orig_idx is not None:
+                pred_index = 0 if orig_idx in (0, 1, 2) else 1
+                # If we also have normalized probs (sum ~=1), compute reduced confidence
+                if probs is not None and isinstance(probs, (list, tuple)) and len(probs) >= 5:
+                    prob1 = float(sum(probs[3:5]))
+                    prob0 = 1.0 - prob1
+                    binary_probs = [prob0, prob1]
+                    reduced_confidence = float(prob1) if pred_index == 1 else float(prob0)
+            else:
+                # Fallback: if normalized probs exist, derive binary prediction from them
+                if probs is not None and isinstance(probs, (list, tuple)) and len(probs) >= 5:
+                    prob1 = float(sum(probs[3:5]))
+                    prob0 = 1.0 - prob1
+                    binary_probs = [prob0, prob1]
+                    pred_index = 1 if prob1 >= prob0 else 0
+                    reduced_confidence = float(max(prob0, prob1))
+        except Exception:
+            pred_index = None
+            reduced_confidence = None
+            binary_probs = None
+
+        # Determine human-readable prediction label
+        try:
+            if pred_index == 1:
+                prediction = "Professional"
+            elif pred_index == 0:
+                prediction = "Ordinary"
+            else:
+                prediction = None
+        except Exception:
+            prediction = None
+
+        # Ensure the raw DumpResults are JSON-serializable for API responses
+        try:
+            safe_raw_dump = _to_json_safe(result_data)
+        except Exception:
+            try:
+                safe_raw_dump = repr(result_data)
+            except Exception:
+                safe_raw_dump = None
+
+        return {
+            "status": "success",
+            "orig_pred_index": orig_idx,
+            "pred_index": pred_index,
+            "prediction": prediction,
+            "raw_probs": _to_json_safe(raw_probs) if raw_probs is not None else None,
+            "probs": _to_json_safe(probs) if probs is not None else None,
+            "binary_probs": _to_json_safe(binary_probs) if binary_probs is not None else None,
+            "confidence": _to_json_safe(confidence) if confidence is not None else None,
+            "reduced_confidence": _to_json_safe(reduced_confidence) if reduced_confidence is not None else None,
+            "topk": _to_json_safe(topk) if topk is not None else None,
+            "raw_dump": safe_raw_dump,
+        }
+    except Exception as _e:
+        debug_log(f"parse_result error: {_e}")
+        return {"status": "error", "message": str(_e)}
+
+
+def run_stgcn_test(csv_path: str):
+    """Run ST-GCN on a single CSV file and return parsed result dict.
+
+    This is the primary external entrypoint expected by the API server.
+    """
+    csv_path = Path(csv_path)
+    if not csv_path.exists():
+        raise FileNotFoundError(f"CSV path not found: {csv_path}")
+
+    cfg, ann_pkl, result_pkl = prepare_config_for_test(csv_path)
+    # Ensure we are working with Path objects (prepare_config_for_test should return Paths,
+    # but coerce defensively in case callers or prior code returned strings).
+    try:
+        ann_pkl = Path(ann_pkl)
+    except Exception:
+        ann_pkl = Path(str(ann_pkl))
+    try:
+        result_pkl = Path(result_pkl)
+    except Exception:
+        result_pkl = Path(str(result_pkl))
+
+    # Best-effort: register mmaction modules
+    _ensure_repo_registration()
+
+    # Create runner and instrument model to capture raw outputs
+    runner = Runner.from_cfg(cfg)
+
+    _raw_outputs = []
+    try:
+        model = getattr(runner, 'model', None) or getattr(runner, 'module', None)
+        orig_forward = getattr(model, 'forward', None) if model is not None else None
+        if orig_forward is not None:
+            def _to_cpu(x):
+                try:
+                    import torch as _torch
+                    if isinstance(x, _torch.Tensor):
+                        return x.detach().cpu().numpy()
+                except Exception:
+                    pass
+                if isinstance(x, (list, tuple)):
+                    return [_to_cpu(v) for v in x]
+                if isinstance(x, dict):
+                    return {k: _to_cpu(v) for k, v in x.items()}
+                return x
+
+            def _wrapped_forward(*a, **kw):
+                out = orig_forward(*a, **kw)
+                try:
+                    _raw_outputs.append(_to_cpu(out))
+                except Exception:
+                    pass
+                return out
+
+            try:
+                model.forward = _wrapped_forward
+                debug_log("Wrapped model.forward to capture raw outputs")
+            except Exception as _e:
+                debug_log(f"Failed to wrap model.forward: {_e}")
+
+    except Exception as _e:
+        debug_log(f"Instrumentation failed: {_e}")
+
+    # Run test (may write result_pkl via DumpResults)
+    try:
+        runner.test()
+    except Exception as _e:
+        debug_log(f"runner.test failed: {_e}")
+        raise
+
+    # Load DumpResults
+    if not result_pkl.exists():
+        raise FileNotFoundError(f"Result PKL not found: {result_pkl}")
+
+    with open(result_pkl, 'rb') as f:
+        result_data = pickle.load(f)
+
+    # Persist raw_full.pkl next to result for debugging
+    try:
+        anns = None
+        try:
+            with open(ann_pkl, 'rb') as af:
+                _ann = pickle.load(af)
+                anns = _ann.get('annotations') if isinstance(_ann, dict) else None
+        except Exception:
+            anns = None
+
+        full_obj = {'dump_results': result_data, 'annotations': anns}
+        if _raw_outputs:
+            full_obj['raw_model_outputs'] = _raw_outputs
+        # Log the incoming result_pkl type/value for debugging (short-circuit noisy dumps)
+        try:
+            debug_log(f"Persisting full PKL; result_pkl type={type(result_pkl)}, repr={repr(result_pkl)[:200]}")
+        except Exception:
+            pass
+
+        # Defensive: ensure result_pkl is a Path so `.stem` is available
+        try:
+            rp = Path(result_pkl)
+        except Exception:
+            try:
+                rp = Path(str(result_pkl))
+            except Exception:
+                # fallback: use repo_results_dir + a unique name
+                rp = Path(__file__).parent / 'results' / f"test_result_fallback_{uuid.uuid4().hex[:8]}.pkl"
+                debug_log(f"Warning: could not coerce result_pkl; using fallback {rp}")
+
+        full_pkl = rp.with_name(rp.stem + '.raw_full.pkl')
+        try:
+            with open(full_pkl, 'wb') as ff:
+                pickle.dump(full_obj, ff, protocol=pickle.HIGHEST_PROTOCOL)
+            debug_log(f"Wrote full raw PKL: {full_pkl}")
+        except Exception as _e:
+            debug_log(f"Failed to write full raw PKL: {_e}")
+    except Exception:
+        pass
+
+    # Parse and return result
+    parsed = parse_result(result_data, raw_model_outputs=_raw_outputs if _raw_outputs else None)
+    # Additional logging: if we captured raw outputs list, log a short preview
+    try:
+        if _raw_outputs:
+            try:
+                preview = _format_row(_raw_outputs[0], max_items=200)
+            except Exception:
+                preview = repr(_raw_outputs[0])
+            debug_log(f"Captured raw_model_outputs[0] preview: {preview}")
+    except Exception:
+        pass
+    return parsed
+
+
+if __name__ == '__main__':
+    import argparse
+    p = argparse.ArgumentParser()
+    p.add_argument('csv', help='CSV file to run inference on')
+    args = p.parse_args()
+    res = run_stgcn_test(args.csv)
+    print(json.dumps(res, indent=2, ensure_ascii=False))

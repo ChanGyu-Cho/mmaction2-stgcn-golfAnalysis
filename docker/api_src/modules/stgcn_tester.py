@@ -484,42 +484,83 @@ def parse_result(result_data, raw_model_outputs: Optional[list]):
                 except Exception:
                     orig_idx = None
 
-        # Map 5-class -> 2-class as finetune_stgcn_test does: {0,1,2} -> 0 ; {3,4} -> 1
+        # Determine whether model already outputs 2-class probabilities/logits
         pred_index = None
         reduced_confidence = None
         binary_probs = None
         try:
-            # Prefer mapping from explicit original predicted label if available
-            if orig_idx is not None:
-                pred_index = 0 if orig_idx in (0, 1, 2) else 1
-                # If we also have normalized probs (sum ~=1), compute reduced confidence
-                if probs is not None and isinstance(probs, (list, tuple)) and len(probs) >= 5:
-                    prob1 = float(sum(probs[3:5]))
-                    prob0 = 1.0 - prob1
-                    binary_probs = [prob0, prob1]
-                    reduced_confidence = float(prob1) if pred_index == 1 else float(prob0)
+            # Case A: probs explicitly present and length==2 -> treat as binary outputs
+            if probs is not None and isinstance(probs, (list, tuple)) and len(probs) == 2:
+                binary_probs = [float(probs[0]), float(probs[1])]
+                # argmax -> 0 or 1
+                pred_index = int(_np.argmax(_np.asarray(binary_probs)))
+                prediction = "Professional" if pred_index == 1 else "Ordinary"
+                reduced_confidence = float(binary_probs[pred_index])
+
+            # Case B: raw_model_outputs contain a vector of length 2 (logits) and probs not set
+            elif raw_model_outputs and isinstance(raw_model_outputs, (list, tuple)):
+                cand = _find_logits_from_raw(raw_model_outputs)
+                if cand is not None:
+                    arr = _to_numpy_safe(cand)
+                    if arr is not None and getattr(arr, 'size', 0) == 2:
+                        # raw logits -> softmax to get probs
+                        s = _softmax(arr)
+                        if s is not None:
+                            binary_probs = [float(s[0]), float(s[1])]
+                            pred_index = int(_np.argmax(_np.asarray(binary_probs)))
+                            prediction = "Professional" if pred_index == 1 else "Ordinary"
+                            reduced_confidence = float(binary_probs[pred_index])
+
+            # Case C: fallback for 5-class outputs (old behavior)
+            elif probs is not None and isinstance(probs, (list, tuple)) and len(probs) >= 5:
+                prob3 = float(probs[3])
+                prob4 = float(probs[4])
+                prob0 = float(probs[0])
+                prob1 = float(probs[1])
+                prob2 = float(probs[2])
+                binary_probs = [float(prob0 + prob1 + prob2), float(prob3 + prob4)]
+
+                prof_max = max(prob3, prob4)
+                ord_max = max(prob0, prob1, prob2)
+                # threshold decision
+                if prof_max >= 0.5:
+                    pred_index = 1
+                    prediction = "Professional"
+                    reduced_confidence = float(prof_max)
+                elif ord_max >= 0.5:
+                    pred_index = 0
+                    prediction = "Ordinary"
+                    reduced_confidence = float(ord_max)
+                else:
+                    if orig_idx is not None:
+                        pred_index = 0 if orig_idx in (0, 1, 2) else 1
+                        prediction = "Ordinary" if pred_index == 0 else "Professional"
+                    else:
+                        pred_index = None
+                        prediction = None
+
             else:
-                # Fallback: if normalized probs exist, derive binary prediction from them
-                if probs is not None and isinstance(probs, (list, tuple)) and len(probs) >= 5:
-                    prob1 = float(sum(probs[3:5]))
-                    prob0 = 1.0 - prob1
-                    binary_probs = [prob0, prob1]
-                    pred_index = 1 if prob1 >= prob0 else 0
-                    reduced_confidence = float(max(prob0, prob1))
+                # No probs available; if orig_idx present and already binary (0/1) respect it
+                if orig_idx is not None:
+                    # If orig_idx looks binary, use it directly; else map 5->2
+                    try:
+                        oi = int(orig_idx)
+                        if oi in (0, 1):
+                            pred_index = oi
+                            prediction = "Professional" if pred_index == 1 else "Ordinary"
+                        else:
+                            pred_index = 0 if oi in (0, 1, 2) else 1
+                            prediction = "Ordinary" if pred_index == 0 else "Professional"
+                    except Exception:
+                        pred_index = None
+                        prediction = None
+                else:
+                    pred_index = None
+                    prediction = None
         except Exception:
             pred_index = None
             reduced_confidence = None
             binary_probs = None
-
-        # Determine human-readable prediction label
-        try:
-            if pred_index == 1:
-                prediction = "Professional"
-            elif pred_index == 0:
-                prediction = "Ordinary"
-            else:
-                prediction = None
-        except Exception:
             prediction = None
 
         # Ensure the raw DumpResults are JSON-serializable for API responses

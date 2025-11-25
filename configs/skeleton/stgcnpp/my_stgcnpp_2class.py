@@ -1,39 +1,38 @@
 # ===================================================================
-# STGCN++ 5-Class Golf Action Recognition Config - STABLE_V3.0 (Generalization & Class Imbalance Focus)
+# STGCN++ 2-Class Golf Action Recognition Config - Derived from my_stgcnpp.py
+# Binary mapping: {0,1,2} -> 0  ;  {3,4} -> 1
 # ===================================================================
 
 # ------------------------ Base Configuration ------------------------
-_base_ = 'default_runtime.py'
+_base_ = '../../_base_/default_runtime.py'
 default_scope = 'mmaction'
 
-# ------------------------ Tunable hyperparameters (일반화 및 불균형 강화 설정) ------------------------
+# ------------------------ Tunable hyperparameters ------------------------
 BATCH_SIZE = 16
 NUM_WORKERS = 4
 LR = 0.0001 
 WEIGHT_DECAY = 0.0005 
 MAX_EPOCHS = 100
 PATIENCE = 10
-WARMUP_EPOCHS = 10 # 👈 Warmup 연장 (안정적인 학습 시작 유도)
+WARMUP_EPOCHS = 10
 FEATS='b'
 
 # ------------------------ Path Configuration ------------------------
-_load_checkpoint_path = "../model.pth"
+_load_checkpoint_path = r"D:\mmaction2\checkpoints\stgcnpp_8xb16-bone-u100-80e_ntu60-xsub-keypoint-2d_20221228-cd11a691.pth"
 dataset_type = 'PoseDataset'
-ann_file = ""
-test_ann_file = ""
+ann_file = r"E:\golfDataset\dataset\crop_pkl\combined_5class.pkl" # source PKL; can be overridden by training script with converted PKL
+test_ann_file = r"D:\golfDataset\dataset\crop_pkl\combined_5class_test.pkl"
 EPOCH = MAX_EPOCHS
 clip_len = 100
 
 # ------------------------ Data Pipeline (Train) ------------------------
 train_pipeline = [
     dict(type='PreNormalize2D'),
-    
-    # RandomAffine: 일반화 개선을 위해 범위 복구 (Test Set 분포 포괄)
     dict(
         type='RandomAffine',
-        scale_range=(0.8, 1.2), # 👈 범위 확대
+        scale_range=(0.8, 1.2),
         shift_range=(-0.1, 0.1),
-        rotate_range=(-15, 15), # 👈 범위 확대
+        rotate_range=(-15, 15),
         shear_range=(0, 0),
         p=0.5
     ),
@@ -77,7 +76,6 @@ test_pipeline = [
     dict(type='FormatGCNInput', num_person=1),
     dict(type='PackActionInputs') 
 ]
-
 
 # ------------------------ Data Loader & Loop ------------------------
 train_dataloader = dict(

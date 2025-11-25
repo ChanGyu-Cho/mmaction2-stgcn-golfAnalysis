@@ -22,7 +22,7 @@ def debug_log(msg: str):
     except Exception:
         pass
 
-def csv_to_pkl(csv_path: Path, out_pkl: Path):
+def csv_to_pkl(csv_path: Path, out_pkl: Path, normalize_method: str = 'none', img_shape=(1080, 1920)):
     # Defensive: accept either str or Path and coerce to Path so `.stem` is safe
     try:
         csv_path = Path(csv_path)
@@ -55,14 +55,26 @@ def csv_to_pkl(csv_path: Path, out_pkl: Path):
     ], axis=0)[0]
     keypoint = np.expand_dims(arr[:, :, :2], axis=0)
     keypoint_score = np.expand_dims(arr[:, :, 2], axis=0)
+    # Optional normalization: convert pixel coords to 0..1 range using img_shape
+    try:
+        if normalize_method == '0to1':
+            h, w = img_shape
+            kp = keypoint.copy()
+            kp[..., 0] = kp[..., 0] / float(w)
+            kp[..., 1] = kp[..., 1] / float(h)
+            keypoint = kp
+    except Exception:
+        # If normalization fails, fall back to unnormalized coords
+        pass
+
     ann = {
         "frame_dir": csv_path.stem,
         "total_frames": df.shape[0],
         "keypoint": keypoint,
         "keypoint_score": keypoint_score,
         "label": 0,
-        "img_shape": (1080, 1920),
-        "original_shape": (1080, 1920),
+        "img_shape": tuple(img_shape),
+        "original_shape": tuple(img_shape),
         "metainfo": {"frame_dir": csv_path.stem},
     }
     data = {"annotations": [ann], "split": {"xsub_val": [csv_path.stem]}}

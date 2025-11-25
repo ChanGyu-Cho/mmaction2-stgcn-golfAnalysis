@@ -44,7 +44,7 @@ except Exception:
         except Exception:
             pass
 
-    def csv_to_pkl(csv_path, out_pkl):
+    def csv_to_pkl(csv_path, out_pkl, normalize_method='none', img_shape=(1080, 1920)):
         # Very small helper: expect csv -> build simple ann.pkl with annotations list
         # This is intentionally minimal; the project-provided csv_to_pkl is preferred.
         import csv as _csv
@@ -105,14 +105,46 @@ def prepare_config_for_test(csv_path: Path) -> tuple:
     ann_pkl_path = repo_results_dir / f"test_ann_{unique_id}.pkl"
     result_pkl_path = repo_results_dir / f"test_result_{unique_id}.pkl"
 
-    # Convert CSV to PKL using project helper (preferred)
-    debug_log(f"Converting CSV to PKL: {csv_path} -> {ann_pkl_path}")
+    # Convert CSV to PKL using project helper (preferred). Prefer to
+    # normalize coordinates to 0..1 for ST-GCN inference.
+    debug_log(f"Converting CSV to PKL: {csv_path} -> {ann_pkl_path} (normalize=0to1)")
+    # Attempt to derive img_shape from cfg if present (later loaded), else use default
+    img_shape = (1080, 1920)
+    try:
+        # try to peek at cfg file on disk to extract img_shape if available
+        config_path = Path(__file__).parent / 'my_stgcnpp.py'
+        if config_path.exists():
+            try:
+                # Load minimal config just to inspect dataset img_shape
+                tmp_cfg = Config.fromfile(str(config_path))
+                td = getattr(tmp_cfg, 'test_dataloader', None)
+                if isinstance(td, dict):
+                    ds = td.get('dataset', {})
+                    if isinstance(ds, dict) and 'img_shape' in ds:
+                        img_shape = tuple(ds['img_shape'])
+                else:
+                    try:
+                        ds = getattr(td, 'dataset', None)
+                        if ds is not None and getattr(ds, 'img_shape', None) is not None:
+                            img_shape = tuple(ds.img_shape)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+    except Exception:
+        pass
+
     # csv_to_pkl in modules.utils expects Path-like objects so pass Paths (not str)
     try:
-        csv_to_pkl(Path(csv_path), Path(ann_pkl_path))
+        csv_to_pkl(Path(csv_path), Path(ann_pkl_path), normalize_method='0to1', img_shape=img_shape)
     except TypeError:
-        # fallback: if csv_to_pkl expects strings in some environments, try str
-        csv_to_pkl(str(csv_path), str(ann_pkl_path))
+        # fallback: if csv_to_pkl expects strings or differing signature, try string args
+        try:
+            csv_to_pkl(str(csv_path), str(ann_pkl_path), normalize_method='0to1', img_shape=img_shape)
+        except TypeError:
+            # ultimate fallback: call without normalization
+            debug_log('csv_to_pkl signature incompatible; calling without normalize args')
+            csv_to_pkl(Path(csv_path), Path(ann_pkl_path))
 
     # Load config file from same directory as this module (`my_stgcnpp.py`)
     config_path = Path(__file__).parent / 'my_stgcnpp.py'
@@ -610,6 +642,38 @@ def run_stgcn_test(csv_path: str):
         result_pkl = Path(result_pkl)
     except Exception:
         result_pkl = Path(str(result_pkl))
+
+    # Debug: log input PKL keypoint arrays (shape + short preview) before inference
+    try:
+        with open(ann_pkl, 'rb') as af:
+            _ann = pickle.load(af)
+        _anns = _ann.get('annotations') if isinstance(_ann, dict) else None
+        if _anns:
+            for idx, a in enumerate(_anns):
+                try:
+                    kp = a.get('keypoint')
+                    # convert to numpy safely for shape/preview
+                    try:
+                        kp_arr = _np.asarray(kp)
+                    except Exception:
+                        kp_arr = kp
+                    try:
+                        shp = getattr(kp_arr, 'shape', None)
+                    except Exception:
+                        shp = None
+                    debug_log(f"ANN PKL[{idx}] frame_dir={a.get('frame_dir')} keypoint.shape={shp}")
+                    # preview first person's first frame (or flatten if small)
+                    try:
+                        preview_src = kp_arr
+                        if hasattr(kp_arr, 'ndim') and kp_arr.ndim >= 3:
+                            preview_src = kp_arr[0, 0]
+                        debug_log(f"ANN PKL[{idx}] keypoint preview: {_format_row(preview_src, max_items=200)}")
+                    except Exception as _e:
+                        debug_log(f"ANN PKL[{idx}] preview error: {_e}")
+                except Exception as _e:
+                    debug_log(f"Failed to log annotation[{idx}] coords: {_e}")
+    except Exception as _e:
+        debug_log(f"Could not open/parse ann_pkl for logging: {_e}")
 
     # Best-effort: register mmaction modules
     _ensure_repo_registration()

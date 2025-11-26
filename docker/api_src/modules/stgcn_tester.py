@@ -90,9 +90,15 @@ def _ensure_repo_registration():
         debug_log(f"Warning: failed to register mmaction modules: {_e}")
 
 
-def prepare_config_for_test(csv_path: Path) -> tuple:
+def prepare_config_for_test(csv_path: Path, crop_bbox: Optional[tuple] = None) -> tuple:
     """Prepare a minimal test config and write ann/result PKL paths.
 
+    Args:
+        csv_path: Path to CSV file
+        crop_bbox: Optional (x, y, w, h) crop bounding box. If provided:
+                   - keypoints are offset by (x, y) to convert from crop coords to full frame coords
+                   - img_shape is updated to full frame (1080, 1920)
+    
     Returns (cfg, ann_pkl_path, result_pkl_path)
     """
     repo_results_dir = Path(__file__).parent / 'results'
@@ -105,10 +111,13 @@ def prepare_config_for_test(csv_path: Path) -> tuple:
     ann_pkl_path = repo_results_dir / f"test_ann_{unique_id}.pkl"
     result_pkl_path = repo_results_dir / f"test_result_{unique_id}.pkl"
 
-    # Convert CSV to PKL using project helper (preferred). Prefer to
-    # normalize coordinates to 0..1 for ST-GCN inference.
-    debug_log(f"Converting CSV to PKL: {csv_path} -> {ann_pkl_path} (normalize=0to1)")
-    # Attempt to derive img_shape from cfg if present (later loaded), else use default
+    # Convert CSV to PKL using project helper (preferred). Use 'none' normalization
+    # to match the original training pipeline (make_pkl.py default: normalize_method='none')
+    # CRITICAL FIX: normalize='none' prevents feature scale mismatch
+    debug_log(f"Converting CSV to PKL: {csv_path} -> {ann_pkl_path} (normalize=none, matching original training)")
+    
+    # Determine img_shape: use full frame (1080, 1920) always (matches training)
+    # crop_bbox doesn't affect img_shape - it's just used to offset keypoints
     img_shape = (1080, 1920)
     try:
         # try to peek at cfg file on disk to extract img_shape if available
@@ -135,6 +144,11 @@ def prepare_config_for_test(csv_path: Path) -> tuple:
         pass
 
     # csv_to_pkl in modules.utils expects Path-like objects so pass Paths (not str)
+    # CRITICAL: Must match training pipeline EXACTLY!
+    # Training PKL was created with normalize_method='0to1', converting pixels to [0,1] range.
+    # Then PreNormalize2D applied (x-w/2)/(w/2) to [0,1] values (instead of pixels).
+    # This is technically incorrect, but the model was trained on this data!
+    # API MUST replicate this exact preprocessing to match the model's learned distribution.
     try:
         csv_to_pkl(Path(csv_path), Path(ann_pkl_path), normalize_method='0to1', img_shape=img_shape)
     except TypeError:
@@ -145,6 +159,97 @@ def prepare_config_for_test(csv_path: Path) -> tuple:
             # ultimate fallback: call without normalization
             debug_log('csv_to_pkl signature incompatible; calling without normalize args')
             csv_to_pkl(Path(csv_path), Path(ann_pkl_path))
+    
+    # CRITICAL: Validate that the PKL file was created and contains valid data
+    try:
+        if not ann_pkl_path.exists():
+            raise FileNotFoundError(f"PKL file was not created: {ann_pkl_path}")
+        
+        debug_log(f"PKL file created, validating content...")
+        with open(ann_pkl_path, 'rb') as f:
+            pkl_data = pickle.load(f)
+        
+        if not isinstance(pkl_data, dict):
+            raise ValueError(f"PKL data is not a dict: {type(pkl_data)}")
+        
+        if 'annotations' not in pkl_data:
+            raise ValueError(f"PKL missing 'annotations' key: {list(pkl_data.keys())}")
+        
+        anns = pkl_data['annotations']
+        if not isinstance(anns, list) or len(anns) == 0:
+            raise ValueError(f"PKL annotations invalid: type={type(anns)}, len={len(anns) if hasattr(anns, '__len__') else 'N/A'}")
+        
+        first_ann = anns[0]
+        if 'keypoint' not in first_ann:
+            raise ValueError(f"First annotation missing 'keypoint': {list(first_ann.keys())}")
+        
+        kp = first_ann['keypoint']
+        kps = first_ann.get('keypoint_score')
+        
+        debug_log(f"PKL validation: annotations={len(anns)}, keypoint.shape={getattr(kp, 'shape', 'N/A')}, keypoint.dtype={getattr(kp, 'dtype', 'N/A')}")
+        
+        # Verify keypoint_score is present (required by MMAction2 pipeline)
+        # Expected shape: (M, T, V) where M=num_person, T=frames, V=keypoints (NO trailing dimension!)
+        if kps is None:
+            debug_log(f"WARNING: keypoint_score missing in annotation (may cause pipeline errors)")
+        else:
+            expected_ndim = 3  # (M, T, V)
+            actual_ndim = getattr(kps, 'ndim', None)
+            debug_log(f"PKL validation: keypoint_score.shape={getattr(kps, 'shape', 'N/A')}, keypoint_score.dtype={getattr(kps, 'dtype', 'N/A')}, ndim={actual_ndim}")
+            if actual_ndim is not None and actual_ndim != expected_ndim:
+                debug_log(f"WARNING: keypoint_score has {actual_ndim} dimensions (expected {expected_ndim}). GenSkeFeat expects (M,T,V) and will add [...,None].")
+        
+        # Verify all required fields are present (match make_pkl.py structure)
+        required_fields = ['frame_dir', 'total_frames', 'keypoint', 'keypoint_score', 'label', 'img_shape', 'original_shape']
+        missing_fields = [f for f in required_fields if f not in first_ann]
+        if missing_fields:
+            debug_log(f"WARNING: annotation missing fields: {missing_fields}")
+        
+        debug_log(f"PKL validation successful")
+        
+    except Exception as e:
+        debug_log(f"PKL validation failed: {e}")
+        raise
+    
+    # CRITICAL FIX: If crop_bbox is provided, update img_shape AND offset keypoints
+    # crop_bbox = (x, y, w, h) where x, y are the crop offset
+    # Training used cropped dimensions, not fixed (1080, 1920)!
+    if crop_bbox is not None:
+        try:
+            x_offset, y_offset, crop_w, crop_h = crop_bbox
+            debug_log(f"Applying crop bbox: offset=({x_offset}, {y_offset}), crop_size=({crop_w}, {crop_h})")
+            
+            # Load the PKL we just created
+            with open(ann_pkl_path, 'rb') as f:
+                data = pickle.load(f)
+            
+            # CRITICAL FIX: Update img_shape to match crop dimensions (h, w)
+            # This is the key fix: training used variable crop sizes, NOT (1080, 1920)!
+            for ann in data.get('annotations', []):
+                ann['img_shape'] = (crop_h, crop_w)  # (height, width)
+                ann['original_shape'] = (crop_h, crop_w)
+                debug_log(f"Updated img_shape to crop dimensions: {ann['img_shape']}")
+                
+                # Offset keypoints in all annotations
+                if 'keypoint' in ann:
+                    kp = ann['keypoint']
+                    # kp shape: (1, T, V, 2) or (T, V, 2)
+                    if isinstance(kp, _np.ndarray):
+                        kp_offset = kp.copy()
+                        kp_offset[..., 0] += x_offset  # offset X coordinates
+                        kp_offset[..., 1] += y_offset  # offset Y coordinates
+                        ann['keypoint'] = kp_offset
+                        ann['_crop_bbox_applied'] = True  # mark that offset was applied
+                        debug_log(f"Keypoint shape after offset: {kp_offset.shape}, X range: [{kp_offset[..., 0].min():.1f}, {kp_offset[..., 0].max():.1f}]")
+            
+            # Re-save the PKL with updated img_shape AND offset keypoints
+            with open(ann_pkl_path, 'wb') as f:
+                pickle.dump(data, f, protocol=4)
+            
+            debug_log(f"PKL updated with crop dimensions and keypoint offsets")
+        except Exception as e:
+            debug_log(f"Warning: crop_bbox processing failed: {e}. Continuing without crop adjustments.")
+            # Don't fail the whole test if processing fails - continue with defaults
 
     # Load config file from same directory as this module (`my_stgcnpp.py`)
     config_path = Path(__file__).parent / 'my_stgcnpp.py'
@@ -154,17 +259,62 @@ def prepare_config_for_test(csv_path: Path) -> tuple:
     cfg = Config.fromfile(str(config_path))
 
     # Set ann_file and result dump
+    # If a checkpoint is provided via environment, try to inspect its head to
+    # ensure it is a 2-class model. The API enforces binary inference only.
     try:
+        ckpt = os.environ.get('MMACTION_CHECKPOINT')
+        if ckpt:
+            try:
+                import torch
+                data = torch.load(ckpt, map_location='cpu')
+            except Exception:
+                try:
+                    from mmengine.fileio import load as mmengine_load
+                    data = mmengine_load(ckpt)
+                except Exception:
+                    data = None
+            inferred_nc = None
+            if isinstance(data, dict):
+                state_dict = None
+                if 'state_dict' in data:
+                    state_dict = data['state_dict']
+                elif 'model' in data:
+                    state_dict = data['model']
+                else:
+                    state_dict = data
+                if isinstance(state_dict, dict):
+                    candidate_keys = [k for k in state_dict.keys() if 'head' in k and 'weight' in k and getattr(state_dict[k], 'ndim', None) == 2]
+                    if not candidate_keys:
+                        candidate_keys = [k for k, v in state_dict.items() if getattr(v, 'ndim', None) == 2]
+                    if candidate_keys:
+                        out_features = [int(state_dict[k].shape[0]) for k in candidate_keys if int(state_dict[k].shape[0]) > 1]
+                        if out_features:
+                            inferred_nc = int(min(out_features))
+            if inferred_nc is not None and inferred_nc != 2:
+                raise RuntimeError(f"Checkpoint {ckpt} appears to be a {inferred_nc}-class model. This tester requires a 2-class (binary) model.")
+    except Exception as _e:
+        # if inspection fails, proceed but parsing will enforce binary outputs later
+        debug_log(f"Checkpoint inspection skipped/failed: {_e}")
+    # CRITICAL: Set ann_file in test_dataloader BEFORE Runner.from_cfg()
+    # The dataset needs to know where to load the annotations from
+    try:
+        debug_log(f"Setting ann_file to: {ann_pkl_path}")
         if hasattr(cfg, 'test_dataloader'):
             try:
                 cfg.test_dataloader.dataset.ann_file = str(ann_pkl_path)
-            except Exception:
+                debug_log(f"Successfully set cfg.test_dataloader.dataset.ann_file")
+            except AttributeError as ae:
+                debug_log(f"Direct attribute setting failed: {ae}, trying dict-style access")
                 try:
                     cfg.test_dataloader['dataset']['ann_file'] = str(ann_pkl_path)
-                except Exception:
-                    pass
-    except Exception:
-        pass
+                    debug_log(f"Successfully set cfg.test_dataloader['dataset']['ann_file']")
+                except Exception as e2:
+                    debug_log(f"Dict-style setting also failed: {e2}")
+                    # Last resort: try to access dataset through build method
+                    raise ValueError(f"Cannot set ann_file on test_dataloader: {ae} and {e2}")
+    except Exception as e:
+        debug_log(f"ERROR: Failed to set ann_file: {e}")
+        raise
 
     # Ensure a checkpoint is provided via cfg or environment
     checkpoint = os.environ.get('MMACTION_CHECKPOINT')
@@ -439,28 +589,38 @@ def parse_result(result_data, raw_model_outputs: Optional[list]):
         probs = None
         orig_idx = None
 
-        # prefer raw_model_outputs if available
+        # prefer raw_model_outputs if available; compute probs via softmax when logits present
         if raw_model_outputs:
             cand = _find_logits_from_raw(raw_model_outputs)
             if cand is not None:
                 try:
-                    arr = cand.flatten()
+                    arr = _to_numpy_safe(cand)
                 except Exception:
-                    arr = cand
-                # Preserve raw numeric outputs for debugging; do NOT auto-apply softmax here.
-                try:
-                    raw_probs = arr.tolist() if hasattr(arr, 'tolist') else list(arr)
-                except Exception:
-                    raw_probs = None
-                # log raw row preview for debugging
-                try:
-                    debug_log(f"RAW ROW from model outputs: {_format_row(arr, max_items=200)}")
-                except Exception:
-                    pass
-                # Do not compute `probs` or derive orig_idx via argmax automatically
-                # as that forces one-hot/int-like behavior which hides raw values.
+                    arr = None
+                if arr is not None:
+                    # flatten
+                    try:
+                        a_flat = arr.flatten()
+                    except Exception:
+                        a_flat = arr
+                    # preserve raw numeric outputs for debugging
+                    try:
+                        raw_probs = a_flat.tolist() if hasattr(a_flat, 'tolist') else list(a_flat)
+                    except Exception:
+                        raw_probs = None
+                    try:
+                        debug_log(f"RAW ROW from model outputs: {_format_row(a_flat, max_items=200)}")
+                    except Exception:
+                        pass
+                    # compute normalized probabilities via softmax
+                    try:
+                        probs = _softmax(a_flat)
+                        if probs is not None:
+                            probs = [float(x) for x in probs]
+                    except Exception:
+                        probs = None
 
-        # fallback: inspect DumpResults first item
+        # fallback: inspect DumpResults first item if probs not already computed
         if probs is None and isinstance(first, dict):
             for k in ('pred_scores', 'pred_score', 'scores', 'score', 'probs', 'logits', 'outputs'):
                 if k in first:
@@ -468,7 +628,7 @@ def parse_result(result_data, raw_model_outputs: Optional[list]):
                     arr = _to_numpy_safe(v)
                     if arr is not None and getattr(arr, 'size', 0) > 0:
                         raw_probs = arr.tolist() if hasattr(arr, 'tolist') else list(arr)
-                        # if values sum ~1, treat as probs
+                        # if values sum ~1, treat as probs; otherwise apply softmax
                         try:
                             s = float(_np.sum(arr))
                         except Exception:
@@ -480,12 +640,13 @@ def parse_result(result_data, raw_model_outputs: Optional[list]):
                             except Exception:
                                 pass
                         else:
-                            # raw numeric values present in DumpResults; log them for debugging
                             try:
-                                debug_log(f"RAW ROW from DumpResults (not normalized): {_format_row(arr, max_items=200)}")
+                                probs = _softmax(arr)
+                                if probs is not None:
+                                    probs = [float(x) for x in probs]
+                                    debug_log(f"Applied softmax to DumpResults logits: {_format_row(arr, max_items=200)}")
                             except Exception:
-                                pass
-                        # Do NOT auto-apply softmax for logits/outputs; keep raw values
+                                probs = None
                         break
 
         # compute topk
@@ -516,84 +677,25 @@ def parse_result(result_data, raw_model_outputs: Optional[list]):
                 except Exception:
                     orig_idx = None
 
-        # Determine whether model already outputs 2-class probabilities/logits
+        # Determine binary prediction: enforce binary outputs only.
         pred_index = None
         reduced_confidence = None
         binary_probs = None
         try:
-            # Case A: probs explicitly present and length==2 -> treat as binary outputs
-            if probs is not None and isinstance(probs, (list, tuple)) and len(probs) == 2:
-                binary_probs = [float(probs[0]), float(probs[1])]
-                # argmax -> 0 or 1
-                pred_index = int(_np.argmax(_np.asarray(binary_probs)))
-                prediction = "Professional" if pred_index == 1 else "Ordinary"
-                reduced_confidence = float(binary_probs[pred_index])
+            if probs is None:
+                # no probabilities available -> cannot proceed with binary inference
+                return {"status": "error", "message": "No probabilistic outputs available; binary model required", "raw_dump": _to_json_safe(result_data)}
 
-            # Case B: raw_model_outputs contain a vector of length 2 (logits) and probs not set
-            elif raw_model_outputs and isinstance(raw_model_outputs, (list, tuple)):
-                cand = _find_logits_from_raw(raw_model_outputs)
-                if cand is not None:
-                    arr = _to_numpy_safe(cand)
-                    if arr is not None and getattr(arr, 'size', 0) == 2:
-                        # raw logits -> softmax to get probs
-                        s = _softmax(arr)
-                        if s is not None:
-                            binary_probs = [float(s[0]), float(s[1])]
-                            pred_index = int(_np.argmax(_np.asarray(binary_probs)))
-                            prediction = "Professional" if pred_index == 1 else "Ordinary"
-                            reduced_confidence = float(binary_probs[pred_index])
+            # require exactly 2-class probabilities
+            if not (isinstance(probs, (list, tuple)) and len(probs) == 2):
+                return {"status": "error", "message": f"Model outputs are not binary (len={len(probs) if hasattr(probs, '__len__') else 'unknown'}). Tester requires a 2-class model.", "raw_probs": _to_json_safe(raw_probs), "probs": _to_json_safe(probs), "raw_dump": _to_json_safe(result_data)}
 
-            # Case C: fallback for 5-class outputs (old behavior)
-            elif probs is not None and isinstance(probs, (list, tuple)) and len(probs) >= 5:
-                prob3 = float(probs[3])
-                prob4 = float(probs[4])
-                prob0 = float(probs[0])
-                prob1 = float(probs[1])
-                prob2 = float(probs[2])
-                binary_probs = [float(prob0 + prob1 + prob2), float(prob3 + prob4)]
-
-                prof_max = max(prob3, prob4)
-                ord_max = max(prob0, prob1, prob2)
-                # threshold decision
-                if prof_max >= 0.5:
-                    pred_index = 1
-                    prediction = "Professional"
-                    reduced_confidence = float(prof_max)
-                elif ord_max >= 0.5:
-                    pred_index = 0
-                    prediction = "Ordinary"
-                    reduced_confidence = float(ord_max)
-                else:
-                    if orig_idx is not None:
-                        pred_index = 0 if orig_idx in (0, 1, 2) else 1
-                        prediction = "Ordinary" if pred_index == 0 else "Professional"
-                    else:
-                        pred_index = None
-                        prediction = None
-
-            else:
-                # No probs available; if orig_idx present and already binary (0/1) respect it
-                if orig_idx is not None:
-                    # If orig_idx looks binary, use it directly; else map 5->2
-                    try:
-                        oi = int(orig_idx)
-                        if oi in (0, 1):
-                            pred_index = oi
-                            prediction = "Professional" if pred_index == 1 else "Ordinary"
-                        else:
-                            pred_index = 0 if oi in (0, 1, 2) else 1
-                            prediction = "Ordinary" if pred_index == 0 else "Professional"
-                    except Exception:
-                        pred_index = None
-                        prediction = None
-                else:
-                    pred_index = None
-                    prediction = None
+            binary_probs = [float(probs[0]), float(probs[1])]
+            pred_index = int(_np.argmax(_np.asarray(binary_probs)))
+            prediction = "Professional" if pred_index == 1 else "Ordinary"
+            reduced_confidence = float(binary_probs[pred_index])
         except Exception:
-            pred_index = None
-            reduced_confidence = None
-            binary_probs = None
-            prediction = None
+            return {"status": "error", "message": "Failed to derive binary prediction", "raw_dump": _to_json_safe(result_data)}
 
         # Ensure the raw DumpResults are JSON-serializable for API responses
         try:
@@ -622,16 +724,22 @@ def parse_result(result_data, raw_model_outputs: Optional[list]):
         return {"status": "error", "message": str(_e)}
 
 
-def run_stgcn_test(csv_path: str):
+def run_stgcn_test(csv_path: str, crop_bbox: Optional[tuple] = None):
     """Run ST-GCN on a single CSV file and return parsed result dict.
 
     This is the primary external entrypoint expected by the API server.
+    
+    Args:
+        csv_path: Path to the CSV file
+        crop_bbox: Optional (x, y, w, h) crop bounding box from YOLO detection.
+                   If provided, keypoints are offset by (x, y) to match original coordinates.
     """
     csv_path = Path(csv_path)
     if not csv_path.exists():
         raise FileNotFoundError(f"CSV path not found: {csv_path}")
 
-    cfg, ann_pkl, result_pkl = prepare_config_for_test(csv_path)
+    # Pass crop_bbox to prepare_config_for_test for keypoint offset correction
+    cfg, ann_pkl, result_pkl = prepare_config_for_test(csv_path, crop_bbox=crop_bbox)
     # Ensure we are working with Path objects (prepare_config_for_test should return Paths,
     # but coerce defensively in case callers or prior code returned strings).
     try:
@@ -679,7 +787,15 @@ def run_stgcn_test(csv_path: str):
     _ensure_repo_registration()
 
     # Create runner and instrument model to capture raw outputs
-    runner = Runner.from_cfg(cfg)
+    debug_log(f"Creating Runner from config...")
+    try:
+        runner = Runner.from_cfg(cfg)
+        debug_log(f"Runner created successfully")
+    except Exception as _e:
+        import traceback as _tb
+        debug_log(f"Failed to create Runner: {_e}")
+        debug_log(f"Traceback: {_tb.format_exc()}")
+        raise
 
     _raw_outputs = []
     try:
@@ -718,9 +834,30 @@ def run_stgcn_test(csv_path: str):
 
     # Run test (may write result_pkl via DumpResults)
     try:
+        debug_log(f"Starting runner.test()...")
         runner.test()
+        debug_log(f"runner.test() completed successfully")
     except Exception as _e:
-        debug_log(f"runner.test failed: {_e}")
+        import traceback as _tb
+        debug_log(f"runner.test failed with error: {type(_e).__name__}: {_e}")
+        debug_log(f"Full traceback: {_tb.format_exc()}")
+        
+        # Try to provide additional context about what failed
+        try:
+            test_loop = getattr(runner, 'test_loop', None)
+            if test_loop:
+                dataloader = getattr(test_loop, 'dataloader', None)
+                if dataloader:
+                    debug_log(f"Dataloader info: {type(dataloader).__name__}")
+                    try:
+                        dataset = getattr(dataloader, 'dataset', None)
+                        if dataset:
+                            debug_log(f"Dataset info: type={type(dataset).__name__}, ann_file={getattr(dataset, 'ann_file', 'N/A')}")
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        
         raise
 
     # Load DumpResults

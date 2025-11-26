@@ -26,7 +26,11 @@ clip_len = 100
 
 # ------------------------ Data Pipeline (Train) ------------------------
 train_pipeline = [
-    dict(type='PreNormalize2D'),
+    # CRITICAL: PreNormalize2D is DISABLED!
+    # Training PKL already has keypoints in [0,1] range (normalized by make_pkl.py).
+    # PreNormalize2D would apply (x-w/2)/(w/2) to [0,1] values → ~[-1,-1] (garbage).
+    # The model was trained WITHOUT PreNormalize2D, so we must skip it in API too!
+    # dict(type='PreNormalize2D'),  # ❌ DISABLED
     
     # RandomAffine: 일반화 개선을 위해 범위 복구 (Test Set 분포 포괄)
     dict(
@@ -53,7 +57,7 @@ train_pipeline = [
 
 # ------------------------ Data Pipeline (Val/Test) ------------------------
 val_pipeline = [
-    dict(type='PreNormalize2D'),
+    # dict(type='PreNormalize2D'),  # ❌ DISABLED - see train_pipeline comment
     dict(type='GenSkeFeat', dataset='coco', feats=[FEATS]),
     dict(
         type='UniformSampleFrames',
@@ -66,7 +70,7 @@ val_pipeline = [
 ]
 
 test_pipeline = [
-    dict(type='PreNormalize2D'),
+    # dict(type='PreNormalize2D'),  # ❌ DISABLED - see train_pipeline comment
     dict(type='GenSkeFeat', dataset='coco', feats=[FEATS]),
     dict(
         type='UniformSampleFrames',

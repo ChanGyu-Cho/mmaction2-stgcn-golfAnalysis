@@ -36,9 +36,18 @@ RUN ${PYTHON} -m mim install mmengine==0.10.7 mmcv==2.1.0
 # NOTE: This Dockerfile expects the build context to be the mmaction2 repo root
 # (D:\mmaction2). Build from the repo root with:
 #   docker build -f docker\Dockerfile.base -t mmaction2-base .
-# The COPY below will place your local sources into /mmaction2 in the image.
+# CRITICAL: Only copy MMAction2 core sources, NOT docker/ to avoid stale API code
 RUN conda clean --all
-COPY . /mmaction2
+
+# Copy only necessary MMAction2 components (exclude docker/ and other build artifacts)
+COPY mmaction /mmaction2/mmaction
+COPY configs /mmaction2/configs
+COPY tools /mmaction2/tools
+COPY setup.py /mmaction2/setup.py
+COPY setup.cfg /mmaction2/setup.cfg
+COPY README.md /mmaction2/README.md
+COPY requirements /mmaction2/requirements
+
 WORKDIR /mmaction2
 RUN mkdir -p /mmaction2/data
 ENV FORCE_CUDA="1"

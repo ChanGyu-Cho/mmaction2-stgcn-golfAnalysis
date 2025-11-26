@@ -1,0 +1,19 @@
+# Docker 빌드 시 제외할 항목
+# NOTE: .dockerignore는 모든 Dockerfile에 공통 적용되므로
+# Dockerfile.base와 Dockerfile 모두에서 필요한 docker/ 폴더는 제외하지 않음
+
+# 기타 불필요한 파일들
+.git/
+.github/
+*.pyc
+__pycache__/
+*.egg-info/
+.vscode/
+.idea/
+*.log
+.DS_Store
+tmp_cfg/
+tmp_pkl/
+work_dirs/
+checkpoints/*.pth
+!checkpoints/stgcnpp*.pth

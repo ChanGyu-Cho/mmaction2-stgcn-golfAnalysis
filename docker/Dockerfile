@@ -30,6 +30,7 @@ ENV PYTHONPATH="/mmaction2:/mmaction2/mmaction:/mmaction2/api_src:${PYTHONPATH}"
 # 3. 나머지 FastAPI 서버 코드 복사
 # 이제 이 COPY 명령은 requirements.txt가 변경되지 않은 경우에도 이후의 레이어에만 영향을 미칩니다.
 COPY ./docker/api_src /mmaction2/api_src/
+COPY ./docker/api_src/model.pth /mmaction2/api_src/model.pth
 
 # expose an extra test port (if needed)
 EXPOSE 19031

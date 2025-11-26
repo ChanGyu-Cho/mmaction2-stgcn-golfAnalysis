@@ -6,6 +6,7 @@ import tempfile, base64, os
 import logging
 import sys
 import hashlib
+from typing import Optional, List
 
 # test.py와 동일한 구조를 사용하는 stgcn_tester 모듈
 from modules.stgcn_tester import run_stgcn_test
@@ -18,6 +19,7 @@ logging.basicConfig(level=logging.INFO)
 
 class CSVBase64Request(BaseModel):
     csv_base64: str
+    crop_bbox: Optional[List[int]] = None  # CRITICAL FIX: Optional (x, y, w, h) crop bounding box
 
 @app.get("/health")
 def health():
@@ -28,6 +30,10 @@ def mmaction_stgcn_test_endpoint(payload: CSVBase64Request):
     """
     ST-GCN 모델을 사용하여 CSV 데이터를 평가하고 결과를 반환합니다.
     test.py와 동일한 구조로 Runner.from_cfg() -> runner.test() 호출
+    
+    Payload:
+        csv_base64: Base64-encoded CSV content
+        crop_bbox: Optional [x, y, w, h] crop bounding box from YOLO detection
     """
     temp_csv = None
     try:
@@ -52,8 +58,17 @@ def mmaction_stgcn_test_endpoint(payload: CSVBase64Request):
         except Exception:
             pass
         
-        # test.py와 동일한 구조로 테스트 실행
-        result = run_stgcn_test(temp_csv)
+        # CRITICAL FIX: Extract crop_bbox from payload for keypoint offset correction
+        crop_bbox = None
+        if payload.crop_bbox is not None:
+            try:
+                crop_bbox = tuple(payload.crop_bbox)
+                debug_log(f"Crop bbox from payload: {crop_bbox}")
+            except Exception:
+                debug_log(f"Warning: crop_bbox conversion failed")
+        
+        # test.py와 동일한 구조로 테스트 실행 (with crop_bbox correction)
+        result = run_stgcn_test(temp_csv, crop_bbox=crop_bbox)
         try:
             # short result summary for debugging
             if isinstance(result, dict):

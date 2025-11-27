@@ -26,18 +26,12 @@ clip_len = 100
 
 # ------------------------ Data Pipeline (Train) ------------------------
 train_pipeline = [
-    # CRITICAL: PreNormalize2D is DISABLED!
-    # Training PKL already has keypoints in [0,1] range (normalized by make_pkl.py).
-    # PreNormalize2D would apply (x-w/2)/(w/2) to [0,1] values → ~[-1,-1] (garbage).
-    # The model was trained WITHOUT PreNormalize2D, so we must skip it in API too!
-    # dict(type='PreNormalize2D'),  # ❌ DISABLED
-    
-    # RandomAffine: 일반화 개선을 위해 범위 복구 (Test Set 분포 포괄)
+    dict(type='PreNormalize2D'),
     dict(
         type='RandomAffine',
-        scale_range=(0.8, 1.2), # 👈 범위 확대
+        scale_range=(0.8, 1.2),
         shift_range=(-0.1, 0.1),
-        rotate_range=(-15, 15), # 👈 범위 확대
+        rotate_range=(-15, 15),
         shear_range=(0, 0),
         p=0.5
     ),
@@ -57,12 +51,12 @@ train_pipeline = [
 
 # ------------------------ Data Pipeline (Val/Test) ------------------------
 val_pipeline = [
-    # dict(type='PreNormalize2D'),  # ❌ DISABLED - see train_pipeline comment
+    dict(type='PreNormalize2D'),
     dict(type='GenSkeFeat', dataset='coco', feats=[FEATS]),
     dict(
         type='UniformSampleFrames',
         clip_len=clip_len,
-        num_clips=10,
+        num_clips=1,
         test_mode=True),
     dict(type='PoseDecode'),
     dict(type='FormatGCNInput', num_person=1),
@@ -70,7 +64,7 @@ val_pipeline = [
 ]
 
 test_pipeline = [
-    # dict(type='PreNormalize2D'),  # ❌ DISABLED - see train_pipeline comment
+    dict(type='PreNormalize2D'),
     dict(type='GenSkeFeat', dataset='coco', feats=[FEATS]),
     dict(
         type='UniformSampleFrames',
@@ -79,6 +73,8 @@ test_pipeline = [
         test_mode=True),
     dict(type='PoseDecode'),
     dict(type='FormatGCNInput', num_person=1),
+    # Log input stats right after formatting to GCN input
+    dict(type='LogGCNInputStats', prefix='[ServerTest]'),
     dict(type='PackActionInputs') 
 ]
 
@@ -156,6 +152,10 @@ optim_wrapper = dict(
     clip_grad=dict(max_norm=2, norm_type=2))
 
 # ------------------------ Model & Evaluator ------------------------
+custom_imports = dict(
+    imports=['modules.transforms'],
+    allow_failed_imports=False
+)
 val_evaluator = [dict(type='AccMetric')]
 test_evaluator = val_evaluator
 

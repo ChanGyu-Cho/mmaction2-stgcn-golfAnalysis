@@ -81,34 +81,40 @@ def csv_to_pkl(csv_path: Path, out_pkl: Path, normalize_method: str = 'none', im
     
     debug_log(f"Keypoint expanded: shape={keypoint.shape}, dtype={keypoint.dtype}")
     
+    # CRITICAL: Trim static frames BEFORE normalization (matching make_pkl.py order)
+    if trim_static_frames is not None:
+        try:
+            # trim_static_frames expects (T, V, 2) and returns (start_idx, end_idx)
+            # our keypoint currently has shape (1, T, V, 2) -> use first person
+            kp_2d = keypoint[0]  # Get first (and only) person: (T, V, 2)
+            start_idx, end_idx = trim_static_frames(kp_2d, fps=30)
+            if start_idx > 0 or end_idx < (kp_2d.shape[0] - 1):
+                debug_log(f"Trimming static frames: start={start_idx}, end={end_idx} (original frames: {kp_2d.shape[0]})")
+                keypoint = keypoint[:, start_idx:(end_idx + 1), :, :]  # Trim time dimension
+        except Exception as e:
+            debug_log(f"trim_static_frames failed (non-critical): {e}")
+    
     # Optional normalization: convert pixel coords to 0..1 range using img_shape
-    try:
-        # Before normalization, attempt to trim static leading/trailing frames
-        if trim_static_frames is not None:
-            try:
-                # trim_static_frames expects (T, V, 2) and returns (start_idx, end_idx)
-                # our keypoint currently has shape (1, T, V, 2) -> squeeze to (T, V, 2)
-                kp_2d = keypoint[0]  # Get first (and only) person
-                start_idx, end_idx = trim_static_frames(kp_2d, fps=30)
-                if start_idx > 0 or end_idx < (kp_2d.shape[0] - 1):
-                    debug_log(f"Trimming static frames: start={start_idx}, end={end_idx}")
-                    keypoint = keypoint[:, start_idx:(end_idx + 1), :, :]  # Trim all persons, all frames
-                    keypoint_score = keypoint_score[:, start_idx:(end_idx + 1), :, :]  # Trim score too
-            except Exception as e:
-                debug_log(f"trim_static_frames failed (non-critical): {e}")
-                pass
-
-        if normalize_method == '0to1':
+    if normalize_method == '0to1':
+        try:
             h, w = img_shape
             kp = keypoint.copy()
+            
+            # DEBUG: Log BEFORE normalization
+            debug_log(f"BEFORE normalization - keypoint sample: {keypoint[0, 0, :3, :].tolist()}")
+            debug_log(f"BEFORE normalization - range x:[{keypoint[..., 0].min():.2f}, {keypoint[..., 0].max():.2f}], y:[{keypoint[..., 1].min():.2f}, {keypoint[..., 1].max():.2f}]")
+            
             kp[..., 0] = kp[..., 0] / float(w)
             kp[..., 1] = kp[..., 1] / float(h)
             keypoint = kp
-            debug_log(f"Normalized keypoints to 0-1 range")
-    except Exception as e:
-        # If normalization fails, fall back to unnormalized coords
-        debug_log(f"Normalization failed (using unnormalized coords): {e}")
-        pass
+            
+            # DEBUG: Log AFTER normalization
+            debug_log(f"AFTER normalization - keypoint sample: {keypoint[0, 0, :3, :].tolist()}")
+            debug_log(f"AFTER normalization - range x:[{keypoint[..., 0].min():.4f}, {keypoint[..., 0].max():.4f}], y:[{keypoint[..., 1].min():.4f}, {keypoint[..., 1].max():.4f}]")
+            debug_log(f"Normalized keypoints to 0-1 range using img_shape={img_shape}")
+        except Exception as e:
+            # If normalization fails, fall back to unnormalized coords
+            debug_log(f"Normalization failed (using unnormalized coords): {e}")
 
     # CRITICAL: Create keypoint_score with shape (1, T, V) - NO trailing dimension!
     # GenSkeFeat will add [..., None] so we must NOT include it here (would become 5D)

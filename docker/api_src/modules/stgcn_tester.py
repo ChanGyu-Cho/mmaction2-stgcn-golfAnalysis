@@ -111,46 +111,31 @@ def prepare_config_for_test(csv_path: Path, crop_bbox: Optional[tuple] = None) -
     ann_pkl_path = repo_results_dir / f"test_ann_{unique_id}.pkl"
     result_pkl_path = repo_results_dir / f"test_result_{unique_id}.pkl"
 
-    # Convert CSV to PKL using project helper (preferred). Use 'none' normalization
-    # to match the original training pipeline (make_pkl.py default: normalize_method='none')
-    # CRITICAL FIX: normalize='none' prevents feature scale mismatch
-    debug_log(f"Converting CSV to PKL: {csv_path} -> {ann_pkl_path} (normalize=none, matching original training)")
-    
-    # Determine img_shape: use full frame (1080, 1920) always (matches training)
-    # crop_bbox doesn't affect img_shape - it's just used to offset keypoints
+    # CRITICAL: img_shape MUST match training pipeline!
+    # Local finetune_stgcn_test_single.py uses FIXED (1080, 1920) regardless of crop.
+    # Training used YOLO-cropped videos, but make_pkl.py still uses (1080, 1920) for normalization.
+    # This is the coordinate space reference, NOT the actual video dimensions.
+    # 
+    # FIXED to match local: always use (1080, 1920) as in make_pkl.py line 326
     img_shape = (1080, 1920)
+    debug_log(f"Using FIXED img_shape for normalization (matching local): {img_shape}")
+    
+    # DEBUG: Save CSV to results dir for analysis
     try:
-        # try to peek at cfg file on disk to extract img_shape if available
-        config_path = Path(__file__).parent / 'my_stgcnpp.py'
-        if config_path.exists():
-            try:
-                # Load minimal config just to inspect dataset img_shape
-                tmp_cfg = Config.fromfile(str(config_path))
-                td = getattr(tmp_cfg, 'test_dataloader', None)
-                if isinstance(td, dict):
-                    ds = td.get('dataset', {})
-                    if isinstance(ds, dict) and 'img_shape' in ds:
-                        img_shape = tuple(ds['img_shape'])
-                else:
-                    try:
-                        ds = getattr(td, 'dataset', None)
-                        if ds is not None and getattr(ds, 'img_shape', None) is not None:
-                            img_shape = tuple(ds.img_shape)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-    except Exception:
-        pass
+        debug_csv_path = repo_results_dir / f"debug_csv_{unique_id}.csv"
+        import shutil
+        shutil.copy2(str(csv_path), str(debug_csv_path))
+        debug_log(f"DEBUG: Saved input CSV to {debug_csv_path} for analysis")
+    except Exception as e:
+        debug_log(f"Failed to save debug CSV (non-critical): {e}")
 
     # csv_to_pkl in modules.utils expects Path-like objects so pass Paths (not str)
     # CRITICAL: Must match training pipeline EXACTLY!
-    # Training PKL was created with normalize_method='0to1', converting pixels to [0,1] range.
-    # Then PreNormalize2D applied (x-w/2)/(w/2) to [0,1] values (instead of pixels).
-    # This is technically incorrect, but the model was trained on this data!
-    # API MUST replicate this exact preprocessing to match the model's learned distribution.
+    # Training uses normalize='0to1' to convert pixels to [0,1] range, THEN PreNormalize2D.
+    # This is a two-stage normalization: first scale to [0,1], then center-normalize to [-1,+1].
+    # img_shape=(1080,1920) is used for both normalization stages.
     try:
-        csv_to_pkl(Path(csv_path), Path(ann_pkl_path), normalize_method='0to1', img_shape=img_shape)
+        csv_to_pkl(csv_path, ann_pkl_path, normalize_method='0to1', img_shape=img_shape)
     except TypeError:
         # fallback: if csv_to_pkl expects strings or differing signature, try string args
         try:
@@ -210,46 +195,6 @@ def prepare_config_for_test(csv_path: Path, crop_bbox: Optional[tuple] = None) -
     except Exception as e:
         debug_log(f"PKL validation failed: {e}")
         raise
-    
-    # CRITICAL FIX: If crop_bbox is provided, update img_shape AND offset keypoints
-    # crop_bbox = (x, y, w, h) where x, y are the crop offset
-    # Training used cropped dimensions, not fixed (1080, 1920)!
-    if crop_bbox is not None:
-        try:
-            x_offset, y_offset, crop_w, crop_h = crop_bbox
-            debug_log(f"Applying crop bbox: offset=({x_offset}, {y_offset}), crop_size=({crop_w}, {crop_h})")
-            
-            # Load the PKL we just created
-            with open(ann_pkl_path, 'rb') as f:
-                data = pickle.load(f)
-            
-            # CRITICAL FIX: Update img_shape to match crop dimensions (h, w)
-            # This is the key fix: training used variable crop sizes, NOT (1080, 1920)!
-            for ann in data.get('annotations', []):
-                ann['img_shape'] = (crop_h, crop_w)  # (height, width)
-                ann['original_shape'] = (crop_h, crop_w)
-                debug_log(f"Updated img_shape to crop dimensions: {ann['img_shape']}")
-                
-                # Offset keypoints in all annotations
-                if 'keypoint' in ann:
-                    kp = ann['keypoint']
-                    # kp shape: (1, T, V, 2) or (T, V, 2)
-                    if isinstance(kp, _np.ndarray):
-                        kp_offset = kp.copy()
-                        kp_offset[..., 0] += x_offset  # offset X coordinates
-                        kp_offset[..., 1] += y_offset  # offset Y coordinates
-                        ann['keypoint'] = kp_offset
-                        ann['_crop_bbox_applied'] = True  # mark that offset was applied
-                        debug_log(f"Keypoint shape after offset: {kp_offset.shape}, X range: [{kp_offset[..., 0].min():.1f}, {kp_offset[..., 0].max():.1f}]")
-            
-            # Re-save the PKL with updated img_shape AND offset keypoints
-            with open(ann_pkl_path, 'wb') as f:
-                pickle.dump(data, f, protocol=4)
-            
-            debug_log(f"PKL updated with crop dimensions and keypoint offsets")
-        except Exception as e:
-            debug_log(f"Warning: crop_bbox processing failed: {e}. Continuing without crop adjustments.")
-            # Don't fail the whole test if processing fails - continue with defaults
 
     # Load config file from same directory as this module (`my_stgcnpp.py`)
     config_path = Path(__file__).parent / 'my_stgcnpp.py'

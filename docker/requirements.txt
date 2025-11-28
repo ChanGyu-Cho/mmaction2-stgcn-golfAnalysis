@@ -23,9 +23,9 @@ typing_extensions==4.7.1
 six==1.16.0
 
 # Numerical / scientific
-# NOTE: numpy is pinned in the base image (Dockerfile.base) to ensure ABI
-# compatibility with compiled extensions (mmcv/mmengine). Do NOT install
-# numpy here to avoid conflicts; keep numpy out of the API requirements.
+# CRITICAL: Pin NumPy to EXACT local version (1.24.3) for deterministic results
+# NumPy version affects floating point operations and array manipulations
+numpy==1.24.3
 scipy==1.10.1
 pandas==2.0.3
 scikit-learn==1.7.2
@@ -36,9 +36,11 @@ mmcv==2.1.0
 openmim==0.3.9
 
 # Video / image
-# pin opencv-python to avoid the breaking 4.12+ requirement that needs numpy>=2.x
-# allow recent 4.x releases that remain compatible with numpy 1.x
-opencv-python>=4.6.0,<4.12
+# CRITICAL: OpenCV version matching strategy
+# Local Windows uses 4.12.0 with NumPy 1.24.3, but Linux builds of OpenCV 4.12 require NumPy 2+
+# Since mmcv/mmengine require NumPy <2, we use OpenCV 4.11 (closest compatible version)
+# The interpolation/processing differences between 4.11 and 4.12 are minimal compared to 4.6-4.10
+opencv-python==4.11.0.86
 decord==0.6.0
 einops==0.8.1
 moviepy==1.0.3

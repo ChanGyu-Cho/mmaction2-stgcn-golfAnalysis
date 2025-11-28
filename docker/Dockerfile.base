@@ -4,6 +4,8 @@ ARG CUDNN="8"
 
 FROM pytorch/pytorch:${PYTORCH}-cuda${CUDA}-cudnn${CUDNN}-devel
 
+# Note: PyTorch base image uses Python 3.10+ (local uses 3.8)
+# Python version difference is minimal; critical dependencies (NumPy, OpenCV) are matched exactly
 # Ensure we explicitly use the Conda Python interpreter from the base image
 ENV PYTHON=/opt/conda/bin/python
 ENV PATH="/opt/conda/bin:${PATH}"
@@ -24,9 +26,9 @@ RUN apt-get update && apt-get install -y git ninja-build libglib2.0-0 libsm6 lib
     && rm -rf /var/lib/apt/lists/*
 
 # Install MMCV (로컬 환경과 동일한 버전)
-# Install a NumPy compatible with extensions built for NumPy 1.x to avoid ABI
-# issues; keep <2 to avoid runtime errors from compiled modules expecting NumPy 1.x
-RUN ${PYTHON} -m pip install --no-cache-dir "numpy<2"
+# CRITICAL: Install exact NumPy version matching local (1.24.3) BEFORE mmcv/mmengine
+# NumPy must be installed first as mmcv/mmengine compile against it
+RUN ${PYTHON} -m pip install --no-cache-dir "numpy==1.24.3"
 
 # Install openmim and install mmengine/mmcv using the same Python interpreter
 RUN ${PYTHON} -m pip install --no-cache-dir openmim

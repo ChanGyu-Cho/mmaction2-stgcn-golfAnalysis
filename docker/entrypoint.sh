@@ -8,10 +8,21 @@ set -euo pipefail
 
 echo "[$(date --iso-8601=seconds)] entrypoint: starting"
 
+# CRITICAL: Ensure threading variables are set for deterministic behavior
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+
+# CRITICAL: Configure CUBLAS for deterministic behavior (required for torch deterministic mode)
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+
 # Ensure /mmaction2 is on PYTHONPATH so imports inside the image find the repo
 export PYTHONPATH="/mmaction2:/mmaction2/mmaction:/mmaction2/api_src:${PYTHONPATH:-}"
 PYTHON=${PYTHON:-python}
 echo "entrypoint: PYTHONPATH=${PYTHONPATH}"
+echo "entrypoint: Threading vars set to 1 for deterministic behavior"
+echo "entrypoint: CUBLAS_WORKSPACE_CONFIG=${CUBLAS_WORKSPACE_CONFIG}"
 
 WAIT_TIMEOUT=${WAIT_TIMEOUT:-60}
 SLEEP_INTERVAL=${SLEEP_INTERVAL:-5}

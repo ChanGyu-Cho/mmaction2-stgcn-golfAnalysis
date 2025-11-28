@@ -24,6 +24,24 @@ from typing import Optional
 
 import numpy as _np
 
+# CRITICAL: Configure PyTorch for deterministic behavior BEFORE any heavy imports
+# This ensures results match local environment exactly
+try:
+    import torch
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    
+    # Set seeds for reproducibility
+    import random
+    random.seed(42)
+    _np.random.seed(42)
+    torch.manual_seed(42)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(42)
+except Exception as _init_err:
+    print(f"Warning: PyTorch deterministic setup failed: {_init_err}")
+
 # Ensure local mmaction2 in sys.path when running inside container/workspace
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MMACTION2_CANDIDATE = REPO_ROOT / 'mmaction2'
@@ -265,6 +283,9 @@ def prepare_config_for_test(csv_path: Path, crop_bbox: Optional[tuple] = None) -
     checkpoint = os.environ.get('MMACTION_CHECKPOINT')
     if checkpoint:
         cfg.load_from = checkpoint
+        # CRITICAL: Prevent checkpoint meta config from overriding our pipeline
+        # Set resume=False to ensure only weights are loaded, not the meta config
+        cfg.resume = False
 
     # Append DumpResults evaluator
     dump_metric = dict(type='DumpResults', out_file_path=str(result_pkl_path))

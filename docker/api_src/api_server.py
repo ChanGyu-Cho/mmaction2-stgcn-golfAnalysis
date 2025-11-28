@@ -8,6 +8,22 @@ import sys
 import hashlib
 from typing import Optional, List
 
+# CRITICAL: Set PyTorch to deterministic mode BEFORE any torch imports
+# This ensures reproducible results matching local environment
+import torch
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+torch.use_deterministic_algorithms(True, warn_only=True)
+
+# Also set random seeds for reproducibility
+import random
+import numpy as np
+random.seed(42)
+np.random.seed(42)
+torch.manual_seed(42)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(42)
+
 # test.py와 동일한 구조를 사용하는 stgcn_tester 모듈
 from modules.stgcn_tester import run_stgcn_test
 from modules.utils import debug_log

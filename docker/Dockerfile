@@ -1,7 +1,7 @@
 # ----------------------------------------
 # MMACTION + FastAPI Layer
 # ----------------------------------------
-FROM mmaction2-base:latest
+FROM bocker060/mmaction2-base:latest
 
 
 # 1. 의존성 파일을 먼저 복사하여 캐시 활용도를 높입니다.
@@ -22,6 +22,18 @@ WORKDIR /mmaction2
 
 ENV FORCE_CUDA="1"
 ENV PORT=19031
+
+# CRITICAL: Set threading environment variables to ensure deterministic behavior
+# matching local environment (prevent multi-threading from causing non-deterministic results)
+ENV OMP_NUM_THREADS=1
+ENV MKL_NUM_THREADS=1
+ENV OPENBLAS_NUM_THREADS=1
+ENV NUMEXPR_NUM_THREADS=1
+
+# CRITICAL: Configure CUBLAS for deterministic behavior
+# Required when using torch.use_deterministic_algorithms(True) with CUDA >= 10.2
+ENV CUBLAS_WORKSPACE_CONFIG=:4096:8
+
 # Allow overriding PYTHONPATH at build/run time. Declare ARG so the variable is defined at build-time,
 # then set ENV using that ARG to avoid BuildKit undefined-variable warnings.
 ARG PYTHONPATH=""

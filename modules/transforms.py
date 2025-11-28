@@ -1,6 +1,8 @@
 import numpy as np
 from mmaction.registry import TRANSFORMS
 
+__all__ = ['PreNormalize2D', 'LogGCNInputStats']
+
 
 @TRANSFORMS.register_module(force=True)
 class PreNormalize2D:
@@ -30,26 +32,28 @@ class PreNormalize2D:
             if kp.ndim == 4 and kp.shape[-1] >= 2:
                 # Normalize only x,y coordinates (not confidence scores)
                 coords = kp[..., :2]  # (M, T, V, 2)
+                try:
+                    pre_mean = float(coords.reshape(-1, 2).mean())
+                    pre_std = float(coords.reshape(-1, 2).std())
+                    print(f"[PreNormalize2D] before mean={pre_mean:.6f} std={pre_std:.6f}")
+                except Exception:
+                    pass
                 
                 # Center by subtracting mean across all valid keypoints
                 # Compute mean over M, T, V dimensions
                 mean_coords = coords.reshape(-1, 2).mean(axis=0)  # (2,)
                 
-                # DEBUG: Log BEFORE center normalization
-                xy_mean_before = float(coords.reshape(-1, 2).mean())
-                xy_std_before = float(coords.reshape(-1, 2).std())
-                print(f"[PreNormalize2D] BEFORE centering: xy mean={xy_mean_before:.6f}, std={xy_std_before:.6f}")
-                
                 # Subtract mean from all coordinates
                 kp_normalized = kp.copy()
                 kp_normalized[..., :2] = coords - mean_coords
                 
-                # DEBUG: Log AFTER center normalization
-                xy_mean_after = float(kp_normalized[..., :2].reshape(-1, 2).mean())
-                xy_std_after = float(kp_normalized[..., :2].reshape(-1, 2).std())
-                print(f"[PreNormalize2D] AFTER centering: xy mean={xy_mean_after:.6f}, std={xy_std_after:.6f}")
-                
                 results['keypoint'] = kp_normalized
+                try:
+                    post_mean = float(kp_normalized[..., :2].reshape(-1, 2).mean())
+                    post_std = float(kp_normalized[..., :2].reshape(-1, 2).std())
+                    print(f"[PreNormalize2D] after  mean={post_mean:.6f} std={post_std:.6f}")
+                except Exception:
+                    pass
                 
         except Exception as e:
             # If normalization fails, log but don't crash

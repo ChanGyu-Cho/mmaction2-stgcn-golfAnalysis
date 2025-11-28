@@ -79,11 +79,20 @@ except Exception:
 def _softmax(arr):
     try:
         a = _np.asarray(arr, dtype=float)
-        a = a - _np.max(a)
-        ex = _np.exp(a)
+        debug_log(f"[_softmax] Input arr: {a.tolist()}")
+        max_val = _np.max(a)
+        debug_log(f"[_softmax] Max value: {max_val}")
+        a_shifted = a - max_val
+        debug_log(f"[_softmax] After max subtraction: {a_shifted.tolist()}")
+        ex = _np.exp(a_shifted)
+        debug_log(f"[_softmax] After exp: {ex.tolist()}")
         s = ex.sum() if ex.sum() != 0 else 1.0
-        return (ex / s).tolist()
-    except Exception:
+        debug_log(f"[_softmax] Sum: {s}")
+        result = (ex / s).tolist()
+        debug_log(f"[_softmax] Final result: {result}")
+        return result
+    except Exception as e:
+        debug_log(f"[_softmax] Exception in numpy path: {e}")
         try:
             import math
             arrf = [float(x) for x in arr]
@@ -564,27 +573,51 @@ def parse_result(result_data, raw_model_outputs: Optional[list]):
                 except Exception:
                     arr = None
                 if arr is not None:
-                    # flatten
+                    # CRITICAL FIX: Handle multi-clip logits from GCNHead
+                    # MMAction2's GCNHead uses average_clips='prob' by default:
+                    # 1. Apply softmax to each clip's logits → probabilities
+                    # 2. Average probabilities across clips → final probability
+                    # This matches the behavior in Runner.test() and local finetune_stgcn_test.py
                     try:
+                        arr_shape = getattr(arr, 'shape', None)
+                        debug_log(f"Raw logits shape: {arr_shape}")
+                        
+                        # If 2D (num_clips, num_classes), apply softmax then average
+                        if arr.ndim == 2:
+                            num_clips, num_classes = arr.shape
+                            debug_log(f"Processing {num_clips} clips with {num_classes} classes")
+                            
+                            # Apply softmax to EACH clip independently (average_clips='prob')
+                            clip_probs = []
+                            for i in range(num_clips):
+                                clip_logits = arr[i, :]  # (num_classes,)
+                                clip_prob = _softmax(clip_logits)  # softmax per clip
+                                clip_probs.append(clip_prob)
+                                debug_log(f"  Clip {i}: logits={clip_logits.tolist()}, probs={clip_prob}")
+                            
+                            # Average probabilities across clips
+                            a_flat = _np.mean(_np.asarray(clip_probs, dtype=float), axis=0)
+                            debug_log(f"Averaged {num_clips} clip probabilities: {a_flat.tolist()}")
+                        elif arr.ndim == 1:
+                            # Single clip: just softmax
+                            a_flat = _np.array(_softmax(arr))
+                            debug_log(f"Single clip logits: {arr.tolist()}, probs: {a_flat.tolist()}")
+                        else:
+                            # Fallback: flatten
+                            debug_log(f"Warning: unexpected logits shape {arr_shape}, flattening")
+                            a_flat = arr.flatten()
+                    except Exception as e:
+                        debug_log(f"Failed to process multi-clip logits: {e}")
                         a_flat = arr.flatten()
-                    except Exception:
-                        a_flat = arr
-                    # preserve raw numeric outputs for debugging
+                    
+                    # raw_probs will be the averaged probabilities (not logits)
                     try:
                         raw_probs = a_flat.tolist() if hasattr(a_flat, 'tolist') else list(a_flat)
                     except Exception:
                         raw_probs = None
-                    try:
-                        debug_log(f"RAW ROW from model outputs: {_format_row(a_flat, max_items=200)}")
-                    except Exception:
-                        pass
-                    # compute normalized probabilities via softmax
-                    try:
-                        probs = _softmax(a_flat)
-                        if probs is not None:
-                            probs = [float(x) for x in probs]
-                    except Exception:
-                        probs = None
+                    # a_flat is already probabilities (averaged across clips with softmax)
+                    probs = [float(x) for x in a_flat] if hasattr(a_flat, '__iter__') else None
+                    debug_log(f"Final probabilities: {probs}")
 
         # fallback: inspect DumpResults first item if probs not already computed
         if probs is None and isinstance(first, dict):
@@ -764,8 +797,35 @@ def run_stgcn_test(csv_path: str, crop_bbox: Optional[tuple] = None):
         raise
 
     _raw_outputs = []
+    _raw_logits = []  # Store raw logits from cls_head
     try:
         model = getattr(runner, 'model', None) or getattr(runner, 'module', None)
+        
+        # CRITICAL FIX: Wrap cls_head.forward to capture raw logits BEFORE softmax/argmax
+        # GCNHead.forward returns logits, which are then processed by test_step
+        try:
+            cls_head = getattr(model, 'cls_head', None) if model is not None else None
+            if cls_head is not None:
+                orig_cls_forward = getattr(cls_head, 'forward', None)
+                if orig_cls_forward is not None:
+                    def _wrapped_cls_forward(*a, **kw):
+                        logits = orig_cls_forward(*a, **kw)
+                        # Capture raw logits before any post-processing
+                        try:
+                            import torch as _torch
+                            if isinstance(logits, _torch.Tensor):
+                                _raw_logits.append(logits.detach().cpu().numpy())
+                                debug_log(f"Captured cls_head logits: shape={logits.shape}, device={logits.device}")
+                        except Exception as _e:
+                            debug_log(f"Failed to capture cls_head logits: {_e}")
+                        return logits
+                    
+                    cls_head.forward = _wrapped_cls_forward
+                    debug_log("Wrapped cls_head.forward to capture raw logits")
+        except Exception as _e:
+            debug_log(f"Failed to wrap cls_head.forward: {_e}")
+        
+        # Also wrap model.forward for backward compatibility
         orig_forward = getattr(model, 'forward', None) if model is not None else None
         if orig_forward is not None:
             def _to_cpu(x):
@@ -846,6 +906,9 @@ def run_stgcn_test(csv_path: str, crop_bbox: Optional[tuple] = None):
         full_obj = {'dump_results': result_data, 'annotations': anns}
         if _raw_outputs:
             full_obj['raw_model_outputs'] = _raw_outputs
+        if _raw_logits:
+            full_obj['raw_logits'] = _raw_logits
+            debug_log(f"Captured {len(_raw_logits)} raw logit arrays from cls_head")
         # Log the incoming result_pkl type/value for debugging (short-circuit noisy dumps)
         try:
             debug_log(f"Persisting full PKL; result_pkl type={type(result_pkl)}, repr={repr(result_pkl)[:200]}")
@@ -874,14 +937,21 @@ def run_stgcn_test(csv_path: str, crop_bbox: Optional[tuple] = None):
         pass
 
     # Parse and return result
-    parsed = parse_result(result_data, raw_model_outputs=_raw_outputs if _raw_outputs else None)
-    # Additional logging: if we captured raw outputs list, log a short preview
+    # CRITICAL: Pass _raw_logits (from cls_head) as priority over _raw_outputs
+    parsed = parse_result(result_data, raw_model_outputs=_raw_logits if _raw_logits else _raw_outputs)
+    # Additional logging: if we captured raw logits, log preview
     try:
-        if _raw_outputs:
+        if _raw_logits:
+            try:
+                preview = _format_row(_raw_logits[0], max_items=200)
+            except Exception:
+                preview = repr(_raw_logits[0])[:200]
+            debug_log(f"Captured raw_logits[0] preview: {preview}")
+        elif _raw_outputs:
             try:
                 preview = _format_row(_raw_outputs[0], max_items=200)
             except Exception:
-                preview = repr(_raw_outputs[0])
+                preview = repr(_raw_outputs[0])[:200]
             debug_log(f"Captured raw_model_outputs[0] preview: {preview}")
     except Exception:
         pass

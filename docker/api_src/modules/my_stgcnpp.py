@@ -64,7 +64,6 @@ val_pipeline = [
 ]
 
 test_pipeline = [
-    dict(type='PreNormalize2D'),
     dict(type='GenSkeFeat', dataset='coco', feats=[FEATS]),
     dict(
         type='UniformSampleFrames',
@@ -72,6 +71,8 @@ test_pipeline = [
         num_clips=10,
         test_mode=True),
     dict(type='PoseDecode'),
+    # Apply centering AFTER decode/scale to ensure mean≈0 at input
+    dict(type='PreNormalize2D'),
     dict(type='FormatGCNInput', num_person=1),
     # Log input stats right after formatting to GCN input
     dict(type='LogGCNInputStats', prefix='[ServerTest]'),

@@ -7,6 +7,12 @@
 _base_ = '../../_base_/default_runtime.py'
 default_scope = 'mmaction'
 
+# ------------------------ Custom Imports ------------------------
+custom_imports = dict(
+    imports=['modules.transforms'],
+    allow_failed_imports=False
+)
+
 # ------------------------ Tunable hyperparameters ------------------------
 BATCH_SIZE = 16
 NUM_WORKERS = 4
@@ -65,7 +71,6 @@ val_pipeline = [
 ]
 
 test_pipeline = [
-    dict(type='PreNormalize2D'),
     dict(type='GenSkeFeat', dataset='coco', feats=[FEATS]),
     dict(
         type='UniformSampleFrames',
@@ -73,7 +78,10 @@ test_pipeline = [
         num_clips=10,
         test_mode=True),
     dict(type='PoseDecode'),
+    # Apply centering AFTER any decode/scale steps
+    dict(type='PreNormalize2D'),
     dict(type='FormatGCNInput', num_person=1),
+    dict(type='LogGCNInputStats', prefix='[LocalTest]'),
     dict(type='PackActionInputs') 
 ]
 

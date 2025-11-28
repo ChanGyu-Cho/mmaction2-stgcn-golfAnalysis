@@ -50,9 +50,11 @@ EXPOSE 19031
 WORKDIR /mmaction2/api_src
 
 # Copy entrypoint that performs pre-import checks and starts the server
-COPY ./docker/entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod +x /usr/local/bin/entrypoint.sh
+# Use ADD instead of COPY to handle Unix line endings properly
+ADD docker/entrypoint.sh /usr/local/bin/entrypoint.sh
+# Convert CRLF to LF (Windows to Unix line endings)
+RUN sed -i 's/\r$//' /usr/local/bin/entrypoint.sh && chmod +x /usr/local/bin/entrypoint.sh
 
 # Use entrypoint for initialization; CMD provides default args if no command provided
-ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+ENTRYPOINT ["/bin/sh", "/usr/local/bin/entrypoint.sh"]
 CMD ["python", "-m", "uvicorn", "api_src.api_server:app", "--host", "0.0.0.0", "--port", "19031"]
